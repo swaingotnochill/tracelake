@@ -1,3 +1,4 @@
+use crate::span::Span;
 use thiserror::Error;
 
 const SPAN_KEY_VERSION: &str = "v1";
@@ -31,6 +32,9 @@ pub enum KeyError {
 
     #[error("timestamp segment is invalid: {value}")]
     InvalidTimestamp { value: String },
+
+    #[error("timestamp is outside supported nanosecond range")]
+    TimestampOutOfRange,
 }
 
 pub fn encode_span_key(
@@ -82,6 +86,18 @@ pub fn trace_prefix(tenant_id: &str, namespace: &str, trace_id: &str) -> Result<
     validate_segment("namespace", namespace)?;
     validate_segment("trace_id", trace_id)?;
     Ok(format!("{SPAN_KEY_VERSION}/t/{tenant_id}/ns/{namespace}/tr/{trace_id}/sp/").into_bytes())
+}
+
+pub fn encode_span_storage_key(span: &Span) -> Result<Vec<u8>, KeyError> {
+    encode_span_key(
+        &span.tenant_id,
+        &span.namespace,
+        &span.trace_id,
+        span.start_time
+            .timestamp_nanos_opt()
+            .ok_or(KeyError::TimestampOutOfRange)?,
+        &span.span_id,
+    )
 }
 
 fn split_span_key(key: &str) -> Result<Vec<&str>, KeyError> {
@@ -140,6 +156,8 @@ fn decode_timestamp(value: &str) -> Result<i64, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::span::{Span, SpanStatus, SpanType};
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn span_key_round_trips() {
@@ -235,6 +253,47 @@ mod tests {
             Err(KeyError::InvalidTimestamp {
                 value: "not-a-time".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn span_storage_key_uses_span_identity_and_start_time() {
+        let span = Span {
+            tenant_id: "tenant-1".to_string(),
+            namespace: "default".to_string(),
+            trace_id: "trace-1".to_string(),
+            span_id: "span-1".to_string(),
+            parent_span_id: None,
+            span_type: SpanType::Llm,
+            name: "gpt-4o".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 6, 4, 10, 30, 0).unwrap(),
+            end_time: None,
+            status: SpanStatus::Ok,
+            attributes: serde_json::Value::Null,
+            input: None,
+            output: None,
+            tokens: None,
+            cost_usd: None,
+            model: None,
+            provider: None,
+            error: None,
+            tags: Vec::new(),
+            scores: Vec::new(),
+        };
+
+        let key = encode_span_storage_key(&span).expect("span key should encode");
+        let decoded = decode_span_key(&key).expect("span key should decode");
+
+        assert_eq!(decoded.tenant_id, span.tenant_id);
+        assert_eq!(decoded.namespace, span.namespace);
+        assert_eq!(decoded.trace_id, span.trace_id);
+        assert_eq!(decoded.span_id, span.span_id);
+        assert_eq!(
+            decoded.start_time_ns,
+            span.start_time
+                .timestamp_nanos_opt()
+                .ok_or(KeyError::TimestampOutOfRange)
+                .unwrap()
         );
     }
 }
