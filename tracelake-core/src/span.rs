@@ -82,7 +82,7 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    fn example_span() -> Span {
+    fn get_example_span() -> Span {
         Span {
             tenant_id: "tenantid-1".to_string(),
             namespace: "default".to_string(),
@@ -117,7 +117,7 @@ mod tests {
             tenant_id: "tenant-1".to_string(),
             namespace: "default".to_string(),
             trace_id: "trace-1".to_string(),
-            spans: vec![example_span()],
+            spans: vec![get_example_span()],
         };
 
         let encoded = serde_json::to_string(&trace).expect("trace should serialize");
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn empty_tags_scores_and_null_attributes_are_omitted() {
-        let encoded = serde_json::to_value(example_span()).expect("span should serialize");
+        let encoded = serde_json::to_value(get_example_span()).expect("span should serialize");
 
         assert!(encoded.get("tags").is_none());
         assert!(encoded.get("scores").is_none());
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn custom_span_type_round_trips_through_json() {
-        let mut span = example_span();
+        let mut span = get_example_span();
         span.span_type = SpanType::Custom("workflow_step".to_string());
 
         let encoded = serde_json::to_string(&span).expect("span should serialize");
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn utc_datetime_round_trips_through_json() {
-        let span = example_span();
+        let span = get_example_span();
 
         let encoded = serde_json::to_value(&span).expect("span should serialize");
         assert_eq!(encoded["start_time"], json!("2026-06-04T10:30:00Z"));

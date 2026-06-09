@@ -15,6 +15,10 @@ Before implementing:
 - If multiple interpretations exist, present them — don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
+- Do not edit code unless the user explicitly asks for implementation. If the
+  user asks to "guide", "explain", "understand", "think through", or "start
+  with defining" something, explain the design and Rust concepts step by step
+  without changing source files.
 
 ### 2. Simplicity First
 
@@ -188,6 +192,60 @@ Read them back using scan_prefix().
 
 Verify: write 100K spans, read them back grouped by trace_id.
 Benchmark: SlateDB put() throughput with our key pattern.
+
+#### Step 2 Learning and Debugging Guide
+
+The purpose of `tracelake-ingest` is to make hot trace writes real before any
+compaction or query engine exists. It should prove that a `Span` from
+`tracelake-core` can be encoded into the one canonical SlateDB key, written,
+and read back by trace prefix in deterministic order.
+
+Build this crate in small, testable moves:
+1. Add one public write method, `put_span(&self, span: &Span)`.
+   Verify: one span writes without warnings and can be fetched by its exact key.
+2. Add one read method, `get_trace_spans(...)`.
+   Verify: scan the `trace_prefix(...)` and deserialize the returned values.
+3. Add one batch helper, `put_spans(&self, spans: &[Span])`.
+   Verify: multiple spans from one trace read back sorted by start time.
+4. Add isolation tests.
+   Verify: a trace prefix scan does not return spans from another trace,
+   namespace, or tenant.
+5. Add the 100K span check only after the small tests pass.
+   Verify: spans are grouped by trace_id and the count is exact.
+
+While learning Rust, prefer explicit, idiomatic basics over clever code:
+- Use borrowed inputs for read-only APIs: `&Span`, `&[Span]`, and `&str`.
+- Return `Result<T, IngestError>` from every fallible public ingest function.
+- Use `?` to propagate errors. Do not use `unwrap()` outside tests.
+- Use `thiserror` for error enums and preserve the source error with `#[from]`.
+- Keep async only around SlateDB I/O. Serialization and key encoding are normal
+  synchronous work.
+- Keep functions short. If a function handles key building, serialization,
+  database I/O, and deserialization, split helper functions.
+- Add doc comments to every public struct and public function as the API appears.
+
+Debug correctness before performance:
+- If writes fail, inspect the generated key first. Most ingest bugs will be bad
+  tenant/namespace/trace/span identifiers or timestamp conversion.
+- If reads return nothing, compare the exact span key with the trace prefix.
+  The span key must start with `trace_prefix(tenant_id, namespace, trace_id)`.
+- If ordering is wrong, remember SlateDB sorts bytes lexicographically. The
+  timestamp segment must stay zero-padded to the width defined in
+  `tracelake-core/src/key.rs`.
+- If deserialization fails, print or inspect the stored value bytes in the test
+  and confirm the value is the serialized `Span`, not the key.
+- If only root tests run, use `cargo test --workspace`. Plain `cargo test` at
+  the repository root may not exercise every workspace crate.
+
+Profile only after behavior is correct:
+- First use unit and integration tests to prove exact counts and grouping.
+- Then add a benchmark or ignored test that writes 100K spans with realistic
+  tenant, namespace, trace_id, span_id, timestamps, and payload sizes.
+- Measure separate timings for key encoding, serialization, SlateDB `put()`,
+  and `scan_prefix()` readback. A single total duration hides the bottleneck.
+- Do not claim ingest throughput until the benchmark discloses dataset shape,
+  payload size, durability settings, and whether the object store is in-memory
+  or S3-compatible.
 
 ### Step 3: tracelake-compact — Trace Pack Writer
 
