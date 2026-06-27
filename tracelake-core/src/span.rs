@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// All spans that belong to one trace.
 pub struct Trace {
     pub tenant_id: String,
     pub namespace: String,
@@ -10,6 +11,7 @@ pub struct Trace {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A single recorded operation inside an LLM agent trace.
 pub struct Span {
     pub tenant_id: String,
     pub namespace: String,
@@ -44,6 +46,7 @@ pub struct Span {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// The kind of work represented by a span.
 pub enum SpanType {
     Llm,
     Tool,
@@ -57,6 +60,7 @@ pub enum SpanType {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// The final execution status of a span.
 pub enum SpanStatus {
     Ok,
     Error,
@@ -64,6 +68,7 @@ pub enum SpanStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Token counts reported by an LLM provider.
 pub struct TokenUsage {
     pub prompt: u32,
     pub completion: u32,
@@ -71,6 +76,7 @@ pub struct TokenUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A named evaluation score attached to a span.
 pub struct EvalScore {
     pub name: String,
     pub value: f64,

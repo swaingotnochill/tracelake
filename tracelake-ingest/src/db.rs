@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use crate::ingest::IngestError;
 
+/// Thin SlateDB wrapper for writing and reading hot trace spans.
 pub struct TraceLakeDb {
     db: Db,
 }
 
 impl TraceLakeDb {
+    /// Opens a TraceLake database backed by SlateDB's in-memory object store.
     pub async fn open_in_memory(path: &str) -> Result<Self, IngestError> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Db::builder(path, object_store).build().await?;
@@ -18,6 +20,7 @@ impl TraceLakeDb {
         Ok(Self { db })
     }
 
+    /// Writes one span under its canonical TraceLake storage key.
     pub async fn put_span(&self, span: &Span) -> Result<(), IngestError> {
         let key = encode_span_storage_key(span)?;
         let value = serde_json::to_vec(span)?;
@@ -27,6 +30,7 @@ impl TraceLakeDb {
         Ok(())
     }
 
+    /// Writes multiple spans in one SlateDB batch.
     pub async fn put_spans(&self, spans: &[Span]) -> Result<(), IngestError> {
         let mut batch = WriteBatch::new();
 
@@ -40,13 +44,14 @@ impl TraceLakeDb {
         Ok(())
     }
 
+    /// Reads all spans for one trace from the hot SlateDB store in key order.
     pub async fn get_trace_spans(
         &self,
         tenant_id: &str,
         namespace: &str,
         trace_id: &str,
     ) -> Result<Vec<Span>, IngestError> {
-        let prefix = trace_prefix(&tenant_id, &namespace, &trace_id)?;
+        let prefix = trace_prefix(tenant_id, namespace, trace_id)?;
         let mut iter = self.db.scan_prefix(prefix).await?;
 
         let mut spans = Vec::new();

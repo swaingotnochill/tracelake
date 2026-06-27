@@ -5,6 +5,7 @@ const SPAN_KEY_VERSION: &str = "v1";
 const TIMESTAMP_WIDTH: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded components of a SlateDB span storage key.
 pub struct SpanKey {
     pub tenant_id: String,
     pub namespace: String,
@@ -14,6 +15,7 @@ pub struct SpanKey {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when span storage keys cannot be encoded or decoded.
 pub enum KeyError {
     #[error("{field} cannot be empty")]
     EmptySegment { field: &'static str },
@@ -37,6 +39,7 @@ pub enum KeyError {
     TimestampOutOfRange,
 }
 
+/// Encodes span identity fields into the canonical lexicographic storage key.
 pub fn encode_span_key(
     tenant_id: &str,
     namespace: &str,
@@ -56,6 +59,7 @@ pub fn encode_span_key(
     .into_bytes())
 }
 
+/// Decodes a span storage key into its tenant, namespace, trace, timestamp, and span id.
 pub fn decode_span_key(key: &[u8]) -> Result<SpanKey, KeyError> {
     let key = std::str::from_utf8(key).map_err(|_| KeyError::InvalidUtf8)?;
     let parts = split_span_key(key)?;
@@ -70,17 +74,20 @@ pub fn decode_span_key(key: &[u8]) -> Result<SpanKey, KeyError> {
     })
 }
 
+/// Returns the byte prefix that scopes all keys for one tenant.
 pub fn tenant_prefix(tenant_id: &str) -> Result<Vec<u8>, KeyError> {
     validate_segment("tenant_id", tenant_id)?;
     Ok(format!("{SPAN_KEY_VERSION}/t/{tenant_id}/").into_bytes())
 }
 
+/// Returns the byte prefix that scopes all keys for one namespace.
 pub fn namespace_prefix(tenant_id: &str, namespace: &str) -> Result<Vec<u8>, KeyError> {
     validate_segment("tenant_id", tenant_id)?;
     validate_segment("namespace", namespace)?;
     Ok(format!("{SPAN_KEY_VERSION}/t/{tenant_id}/ns/{namespace}/").into_bytes())
 }
 
+/// Returns the byte prefix that scopes all span keys for one trace.
 pub fn trace_prefix(tenant_id: &str, namespace: &str, trace_id: &str) -> Result<Vec<u8>, KeyError> {
     validate_segment("tenant_id", tenant_id)?;
     validate_segment("namespace", namespace)?;
@@ -88,6 +95,7 @@ pub fn trace_prefix(tenant_id: &str, namespace: &str, trace_id: &str) -> Result<
     Ok(format!("{SPAN_KEY_VERSION}/t/{tenant_id}/ns/{namespace}/tr/{trace_id}/sp/").into_bytes())
 }
 
+/// Builds the canonical storage key for a span.
 pub fn encode_span_storage_key(span: &Span) -> Result<Vec<u8>, KeyError> {
     encode_span_key(
         &span.tenant_id,
