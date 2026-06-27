@@ -1,5 +1,5 @@
 use slatedb::object_store::{ObjectStore, memory::InMemory};
-use slatedb::{Db, DbWriteOps, WriteBatch};
+use slatedb::{Db, WriteBatch};
 use tracelake_core::{Span, encode_span_storage_key, trace_prefix};
 
 use std::sync::Arc;
@@ -42,9 +42,9 @@ impl TraceLakeDb {
 
     pub async fn get_trace_spans(
         &self,
-        tenant_id: String,
-        namespace: String,
-        trace_id: String,
+        tenant_id: &str,
+        namespace: &str,
+        trace_id: &str,
     ) -> Result<Vec<Span>, IngestError> {
         let prefix = trace_prefix(&tenant_id, &namespace, &trace_id)?;
         let mut iter = self.db.scan_prefix(prefix).await?;
@@ -218,11 +218,7 @@ mod tests {
             .expect("spans should write");
 
         let spans = db
-            .get_trace_spans(
-                "tenantid-1".to_string(),
-                "default".to_string(),
-                "trace-1".to_string(),
-            )
+            .get_trace_spans("tenantid-1", "default", "trace-1")
             .await
             .expect("trace spans should read");
 
