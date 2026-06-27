@@ -229,4 +229,30 @@ mod tests {
 
         assert_eq!(spans, vec![earlier, later]);
     }
+
+    #[tokio::test]
+    async fn get_trace_spans_isolated_by_tenant_and_namespace() {
+        let db = TraceLakeDb::open_in_memory("/test-trace-isolation")
+            .await
+            .expect("db should open");
+
+        let wanted = get_example_span();
+
+        let mut other_tenant = wanted.clone();
+        other_tenant.tenant_id = "tenantid-2".to_string();
+
+        let mut other_namespace = wanted.clone();
+        other_namespace.namespace = "other".to_string();
+
+        db.put_spans(&[wanted.clone(), other_tenant, other_namespace])
+            .await
+            .expect("spans should write");
+
+        let spans = db
+            .get_trace_spans("tenantid-1", "default", "trace-1")
+            .await
+            .expect("trace spans should read");
+
+        assert_eq!(spans, vec![wanted]);
+    }
 }
