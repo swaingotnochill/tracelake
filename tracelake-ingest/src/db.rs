@@ -70,6 +70,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::time::Instant;
     use tracelake_core::{KeyError, Span, SpanStatus, SpanType, TokenUsage};
 
     fn get_example_span() -> Span {
@@ -254,5 +255,118 @@ mod tests {
             .expect("trace spans should read");
 
         assert_eq!(spans, vec![wanted]);
+    }
+
+    #[tokio::test]
+    #[ignore = "writes 100K spans; run manually for ingest scale check"]
+    async fn writes_and_reads_100k_spans_grouped_by_traces() {
+        const TRACE_COUNT: usize = 100;
+        const SPANS_PER_TRACE: usize = 1_000;
+        const SPAN_COUNT: usize = TRACE_COUNT * SPANS_PER_TRACE;
+
+        let db = TraceLakeDb::open_in_memory("/test-100k-spans")
+            .await
+            .expect("db should open");
+
+        let mut base = get_example_span();
+        base.input = Some(json!({
+            "prompt": "The user asks the support agent to explain the refund policy \
+                       for order 8837 and escalate a duplicate charge. "
+                .repeat(4)
+        }));
+        base.output = Some(json!({
+            "text": "The agent explains that refunds post within five business days \
+                     and opens a dispute for the duplicate charge. "
+                .repeat(4)
+        }));
+
+        let mut spans = Vec::with_capacity(SPAN_COUNT);
+
+        let generate_started = Instant::now();
+        for trace_num in 0..TRACE_COUNT {
+            for span_num in 0..SPANS_PER_TRACE {
+                let mut span = base.clone();
+                span.trace_id = format!("trace-{trace_num:03}");
+                span.span_id = format!("span-{span_num:04}");
+                span.start_time = base.start_time
+                    + chrono::Duration::nanoseconds(
+                        (trace_num * SPANS_PER_TRACE + span_num) as i64,
+                    );
+                spans.push(span);
+            }
+        }
+        let generate_elapsed = generate_started.elapsed();
+
+        // Measure each ingest phase separately so no single total hides the
+        // bottleneck: key encoding, serialization, SlateDB put(), and the
+        // scan_prefix() readback below.
+        let encode_started = Instant::now();
+        let keys: Vec<Vec<u8>> = spans
+            .iter()
+            .map(|span| encode_span_storage_key(span).expect("key should encode"))
+            .collect();
+        let encode_elapsed = encode_started.elapsed();
+
+        let serialize_started = Instant::now();
+        let values: Vec<Vec<u8>> = spans
+            .iter()
+            .map(|span| serde_json::to_vec(span).expect("span should serialize"))
+            .collect();
+        let serialize_elapsed = serialize_started.elapsed();
+
+        let value_bytes: usize = values.iter().map(|value| value.len()).sum();
+        drop(spans);
+
+        let write_started = Instant::now();
+        let mut batch = WriteBatch::new();
+        for (key, value) in keys.into_iter().zip(values) {
+            batch.put(key, value);
+        }
+        db.db.write(batch).await.expect("100k spans should write");
+        let write_elapsed = write_started.elapsed();
+
+        let read_started = Instant::now();
+        let trace_spans = db
+            .get_trace_spans("tenantid-1", "default", "trace-042")
+            .await
+            .expect("trace spans should read");
+        let read_elapsed = read_started.elapsed();
+
+        let encode_rate = SPAN_COUNT as f64 / encode_elapsed.as_secs_f64();
+        let serialize_rate = SPAN_COUNT as f64 / serialize_elapsed.as_secs_f64();
+        let write_rate = SPAN_COUNT as f64 / write_elapsed.as_secs_f64();
+
+        println!(
+            "100K ingest check: {TRACE_COUNT} traces x {SPANS_PER_TRACE} spans, \
+             ~{} B/span value, one WriteBatch, in-memory object store",
+            value_bytes / SPAN_COUNT
+        );
+        println!(
+            "generate={generate_elapsed:?} encode={encode_elapsed:?} ({encode_rate:.0} keys/s) \
+             serialize={serialize_elapsed:?} ({serialize_rate:.0} spans/s) \
+             write={write_elapsed:?} ({write_rate:.0} puts/s) \
+             read_1k_trace={read_elapsed:?}"
+        );
+
+        assert_eq!(trace_spans.len(), SPANS_PER_TRACE);
+
+        for (index, span) in trace_spans.iter().enumerate() {
+            assert_eq!(span.trace_id, "trace-042");
+            assert_eq!(span.span_id, format!("span-{index:04}"));
+        }
+
+        // Every trace must read back with an exact span count: 100 x 1000 = 100K.
+        for trace_num in 0..TRACE_COUNT {
+            let trace_id = format!("trace-{trace_num:03}");
+            let trace_all = db
+                .get_trace_spans("tenantid-1", "default", &trace_id)
+                .await
+                .expect("trace spans should read");
+            assert_eq!(
+                trace_all.len(),
+                SPANS_PER_TRACE,
+                "trace {trace_id} should hold exactly {SPANS_PER_TRACE} spans"
+            );
+        }
     }
 }
