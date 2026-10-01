@@ -63,6 +63,21 @@ impl TraceLakeDb {
 
         Ok(spans)
     }
+
+    /// Scans every span in the hot store in key order: tenant, namespace,
+    /// trace_id, then start time, then span_id.
+    pub async fn scan_all_spans(&self) -> Result<Vec<Span>, IngestError> {
+        let mut iter = self.db.scan::<Vec<u8>, _>(..).await?;
+
+        let mut spans = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            let span: Span = serde_json::from_slice(&kv.value)?;
+            spans.push(span);
+        }
+
+        Ok(spans)
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +270,49 @@ mod tests {
             .expect("trace spans should read");
 
         assert_eq!(spans, vec![wanted]);
+    }
+
+    #[tokio::test]
+    async fn scan_all_spans_returns_every_span_in_key_order() {
+        let db = TraceLakeDb::open_in_memory("/test-scan-all-spans")
+            .await
+            .expect("db should open");
+
+        let mut first = get_example_span();
+        first.span_id = "span-1".to_string();
+
+        let mut second = get_example_span();
+        second.span_id = "span-2".to_string();
+        second.start_time = Utc
+            .with_ymd_and_hms(2026, 6, 9, 21, 5, 0)
+            .single()
+            .expect("test timestamp should be valid");
+
+        let mut other_trace = get_example_span();
+        other_trace.trace_id = "trace-2".to_string();
+
+        let mut other_namespace = get_example_span();
+        other_namespace.namespace = "other".to_string();
+
+        let mut other_tenant = get_example_span();
+        other_tenant.tenant_id = "tenantid-2".to_string();
+
+        db.put_spans(&[
+            other_tenant.clone(),
+            first.clone(),
+            other_namespace.clone(),
+            second.clone(),
+            other_trace.clone(),
+        ])
+        .await
+        .expect("spans should write");
+
+        let spans = db.scan_all_spans().await.expect("scan should succeed");
+
+        assert_eq!(
+            spans,
+            vec![first, second, other_trace, other_namespace, other_tenant]
+        );
     }
 
     #[tokio::test]

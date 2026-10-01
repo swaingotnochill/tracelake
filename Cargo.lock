@@ -2340,10 +2340,24 @@ name = "tracelake"
 version = "0.1.0"
 
 [[package]]
+name = "tracelake-compact"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "slatedb",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracelake-core",
+ "tracelake-ingest",
+]
+
+[[package]]
 name = "tracelake-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "crc32fast",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
