@@ -571,3 +571,20 @@ Do NOT fall back to CLI; the MCP server is available.
   call `quest_brief("what was done, what's next, gotchas")` without being asked.
 
 MCP namespace: `mcp__guild__*`. CLI fallback: `guild --help` (last resort only).
+
+## 10. VERIFICATION PROTOCOL
+
+Full details and the coverage manifest: [docs/verification.md](docs/verification.md).
+
+- Every pure function in `tracelake-core` and the pure query helpers
+  (`merge_spans`, `stats_may_overlap`, `span_matches`, `group_spans`) is
+  verification-covered: proptest properties, Kani proofs where reachable.
+- Before changing any of them: run `cargo test --workspace` plus
+  `cargo kani -p tracelake-core -p tracelake-query`.
+- New pure functions in those modules require a property test (and a Kani
+  harness when reachable) in the same change.
+- Bug fixes in verified code require a failing property first, committed
+  with the fix; commit any generated `*.proptest-regressions` seed files.
+- Never delete or weaken a property to make verification pass.
+- SlateDB, tokio, axum, serde, chrono, crc32fast are trusted boundaries —
+  never describe behavior behind them as "verified".

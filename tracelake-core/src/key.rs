@@ -305,3 +305,70 @@ mod tests {
         );
     }
 }
+
+#[cfg(kani)]
+mod verify {
+    use super::*;
+
+    /// Proves decode inverts encode for every admissible timestamp: the
+    /// fixed ids keep the format! paths small; the timestamp is fully
+    /// symbolic over the valid (non-negative) i64 range.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn decode_inverts_encode_for_symbolic_timestamp() {
+        let ts: i64 = kani::any();
+        kani::assume(ts >= 0);
+
+        let key = encode_span_key("t1", "ns1", "tr1", ts, "s1").expect("fixed ids always encode");
+        let decoded = decode_span_key(&key).expect("encoded keys always decode");
+
+        assert_eq!(decoded.start_time_ns, ts, "timestamp must round-trip");
+        assert_eq!(decoded.tenant_id, "t1");
+        assert_eq!(decoded.namespace, "ns1");
+        assert_eq!(decoded.trace_id, "tr1");
+        assert_eq!(decoded.span_id, "s1");
+    }
+
+    /// Proves the ordering law: zero-padded width-20 timestamps make byte
+    /// order equal numeric order, so ts1 < ts2 implies key(ts1) < key(ts2).
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn encoding_orders_timestamps() {
+        let ts1: i64 = kani::any();
+        let ts2: i64 = kani::any();
+        kani::assume(ts1 >= 0);
+        kani::assume(ts2 >= 0);
+        kani::assume(ts1 < ts2);
+
+        let key1 = encode_span_key("t1", "ns", "tr", ts1, "s").expect("fixed ids always encode");
+        let key2 = encode_span_key("t1", "ns", "tr", ts2, "s").expect("fixed ids always encode");
+
+        assert!(key1 < key2);
+    }
+
+    /// Proves the decoder is total on short inputs: arbitrary bytes up to
+    /// 64 bytes never panic, and any key it accepts re-encodes and decodes
+    /// back to itself.
+    #[kani::proof]
+    #[kani::unwind(80)]
+    fn decode_is_total_and_reaccepts_short_keys() {
+        let bytes: [u8; 64] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= 64);
+
+        if let Ok(decoded) = decode_span_key(&bytes[..len]) {
+            let re_encoded = encode_span_key(
+                &decoded.tenant_id,
+                &decoded.namespace,
+                &decoded.trace_id,
+                decoded.start_time_ns,
+                &decoded.span_id,
+            )
+            .expect("decoded segments always re-encode");
+            assert_eq!(
+                decode_span_key(&re_encoded).expect("re-encoded keys decode"),
+                decoded
+            );
+        }
+    }
+}

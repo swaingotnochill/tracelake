@@ -239,3 +239,76 @@ mod tests {
         assert!(matches!(error, BloomError::BitCountMismatch { .. }));
     }
 }
+
+#[cfg(kani)]
+mod verify {
+    use super::*;
+
+    /// Builds a four-word filter directly (256 bits): `BloomFilter::new` is
+    /// skipped because its f64 sizing math uses `ln`, which is not modeled.
+    fn fixed_filter(num_hashes: u32) -> BloomFilter {
+        BloomFilter {
+            bits: vec![0u64; 4],
+            num_bits: 256,
+            num_hashes,
+        }
+    }
+
+    /// Proves no false negatives for any key and any hash count in the
+    /// constructor's 1..=32 clamp: insert then contains always hits.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn insert_then_contains_never_loses_a_key() {
+        let key: [u8; 8] = kani::any();
+        let num_hashes: u32 = kani::any();
+        kani::assume(num_hashes >= 1);
+        kani::assume(num_hashes <= 32);
+
+        let mut filter = fixed_filter(num_hashes);
+        filter.insert(&key);
+        assert!(filter.contains(&key));
+    }
+
+    /// Proves encode/decode preserves membership exactly on a filter with
+    /// symbolic words: an inserted key survives, and an arbitrary probe key
+    /// gets the same answer before and after the round-trip.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn encode_decode_preserves_contains() {
+        let words: [u64; 4] = kani::any();
+        let key: [u8; 8] = kani::any();
+        let other: [u8; 8] = kani::any();
+
+        let mut filter = BloomFilter {
+            bits: words.to_vec(),
+            num_bits: 256,
+            num_hashes: 3,
+        };
+        let other_before = filter.contains(&other);
+        filter.insert(&key);
+
+        let decoded =
+            BloomFilter::decode(&filter.encode()).expect("well-formed filters always decode");
+
+        assert!(
+            decoded.contains(&key),
+            "no false negatives after round-trip"
+        );
+        assert_eq!(decoded.contains(&other), other_before);
+    }
+
+    /// Proves decode is total on arbitrary short bytes and that any filter
+    /// it accepts answers contains safely (no out-of-bounds bit indexing).
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn decode_is_total_on_short_bytes() {
+        let bytes: [u8; 64] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= 64);
+
+        if let Ok(filter) = BloomFilter::decode(&bytes[..len]) {
+            let probe: [u8; 8] = kani::any();
+            let _ = filter.contains(&probe);
+        }
+    }
+}

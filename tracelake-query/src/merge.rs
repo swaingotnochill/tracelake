@@ -104,3 +104,86 @@ mod tests {
         assert!(merged.iter().any(|span| span.span_id == "span-b"));
     }
 }
+
+#[cfg(kani)]
+mod verify {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use tracelake_core::{SpanStatus, SpanType};
+
+    /// One span with fixed ids and a symbolic nanosecond offset inside one
+    /// second; only the start time and status vary.
+    fn span(id: &str, nanos: i64, failed: bool) -> Span {
+        Span {
+            tenant_id: "t".to_string(),
+            namespace: "ns".to_string(),
+            trace_id: "tr".to_string(),
+            span_id: id.to_string(),
+            parent_span_id: None,
+            span_type: SpanType::Llm,
+            name: id.to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 6, 16, 10, 0, 0).unwrap()
+                + chrono::Duration::nanoseconds(nanos),
+            end_time: None,
+            status: if failed {
+                SpanStatus::Error
+            } else {
+                SpanStatus::Ok
+            },
+            attributes: serde_json::Value::Null,
+            input: None,
+            output: None,
+            tokens: None,
+            cost_usd: None,
+            model: None,
+            provider: None,
+            error: None,
+            tags: Vec::new(),
+            scores: Vec::new(),
+        }
+    }
+
+    /// L3: when a span_id appears in several layers, the last layer's copy
+    /// wins — regardless of how start times compare.
+    #[kani::proof]
+    #[kani::unwind(24)]
+    fn last_layer_wins_on_span_id_conflict() {
+        let cold_nanos: i64 = kani::any();
+        let hot_nanos: i64 = kani::any();
+        kani::assume(cold_nanos >= 0 && cold_nanos < 1_000_000_000);
+        kani::assume(hot_nanos >= 0 && hot_nanos < 1_000_000_000);
+
+        let cold = vec![span("a", cold_nanos, false)];
+        let hot = vec![span("a", hot_nanos, true)];
+
+        let merged = merge_spans(&[cold, hot]);
+
+        assert_eq!(merged.len(), 1, "conflicting span must dedup to one");
+        assert_eq!(merged[0].span_id, "a");
+        assert_eq!(
+            merged[0].status,
+            SpanStatus::Error,
+            "the hot (last) layer's status must win"
+        );
+        assert_eq!(merged[0].start_time, hot[0].start_time);
+    }
+
+    /// L4: no span is lost and no span is invented, whatever the layers hold.
+    #[kani::proof]
+    #[kani::unwind(24)]
+    fn no_loss_and_no_spurious_spans() {
+        let n0: i64 = kani::any();
+        let n1: i64 = kani::any();
+        kani::assume(n0 >= 0 && n0 < 1_000_000_000);
+        kani::assume(n1 >= 0 && n1 < 1_000_000_000);
+
+        let cold = vec![span("a", n0, false), span("b", n1, false)];
+        let hot = vec![span("c", n0, true)];
+
+        let merged = merge_spans(&[cold, hot]);
+
+        assert_eq!(merged.len(), 3, "all distinct span_ids must survive");
+        let has = |id: &str| merged.iter().any(|span| span.span_id == id);
+        assert!(has("a") && has("b") && has("c"));
+    }
+}

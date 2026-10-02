@@ -1,0 +1,105 @@
+# TraceLake Verification Protocol
+
+This document defines what "verified" means in TraceLake, what is covered,
+how to run the verification suite, and the rules any contributor — human or
+AI agent — must follow when changing verified code.
+
+Companion research: [formal-verification-brief.md](research/formal-verification-brief.md)
+(tool selection), [rocq-of-rust-assessment.md](research/rocq-of-rust-assessment.md)
+(rejected alternative), [fv-implementation-report.md](research/fv-implementation-report.md)
+(first results).
+
+## 1. The three tiers
+
+Every operation we own sits in exactly one tier. A claim of "verified" must
+always name the tier.
+
+| Tier | Meaning | Tools | Trust level |
+|------|---------|-------|-------------|
+| **PROVEN** | Holds for **all** inputs within documented bounds (loop unwinds). No panic, no UB, functional law. | Kani (`#[cfg(kani)] mod verify` in the source file) | Highest — counterexample-free by construction |
+| **PROPERTY** | Holds for hundreds of randomized, shrunk cases; regressions are pinned via committed seed files. | proptest (`tests/prop_*.rs`, `src/search/verification.rs`) | High — bugs in practice |
+| **INTEGRATION** | Behavior checked end-to-end on concrete scenarios. | `#[tokio::test]` suites + router-level HTTP tests | Normal test trust |
+
+**Statistical properties** (e.g. bloom FPR ≤ 2× target) are PROPERTY tier
+with explicitly generous margins; they cannot be proven, only bounded.
+
+## 2. Trusted boundaries (NOT verified, by design)
+
+SlateDB, tokio, axum, `object_store`, serde/serde_json internals, crc32fast,
+and chrono internals are **assumptions**. No proof crosses into them. The
+async orchestration (`get_trace`/`search_traces` flows, compactor I/O,
+server handlers) is INTEGRATION tier: its pure decision logic is extracted
+and verified (see manifest), its I/O choreography is tested.
+
+If SlateDB returns a span `scan_prefix` did not store, no proof we write
+catches that. That is the boundary, stated plainly.
+
+## 3. Coverage manifest
+
+| Function | Tier | Properties | Where |
+|----------|------|------------|-------|
+| `key::encode_span_key` / `decode_span_key` | PROVEN + PROPERTY | decode∘encode identity; ts ordering law; decoder totality on arbitrary bytes; accepted keys re-encode | `key.rs::verify` (Kani), `tests/prop_key.rs` |
+| `key::*_prefix` | PROPERTY | prefix isolation between traces; nested prefix structure | `tests/prop_key.rs` |
+| `key::encode_span_storage_key` | PROPERTY | composes with decode to span identity | `tests/prop_key.rs` |
+| `bloom::BloomFilter` insert/contains | PROVEN + PROPERTY | no false negatives (incl. after encode/decode); membership-exact round-trip | `bloom.rs::verify`, `tests/prop_bloom.rs` |
+| `bloom::BloomFilter::decode` | PROVEN + PROPERTY | totality on arbitrary bytes; accepted filters answer contains safely | same |
+| bloom false-positive rate | statistical | absent-key hit rate < 0.05 at 0.01 target (deterministic hasher) | `tests/prop_bloom.rs` |
+| `trace_pack::encode/decode_trace_pack` | PROVEN + PROPERTY | exact round-trip; every strict prefix rejected; totality on arbitrary bytes; restamped single-byte corruptions never panic through directory search + block read | `trace_pack.rs::verify`, `tests/prop_trace_pack.rs` |
+| `TracePack::read_trace` / `trace_ids` | PROVEN + PROPERTY | only requested block decoded; sorted ids | same |
+| `segment::*` manifest types | PROPERTY | JSON round-trip equality; `next_segment_number` law; `segment_id` formatting (exhaustive 0..=999_999) | `tests/prop_segment.rs` |
+| `query::merge_spans` | PROVEN + PROPERTY | L1 empty→empty; L2 sorted output; L3 last-layer-wins; L4 no-loss/no-spurious; L5 idempotence | `merge.rs::verify`, `tests/prop_merge.rs` |
+| `query::stats_may_overlap` | PROPERTY | prune soundness (never skips a possibly-matching segment) | `src/search/verification.rs` — Kani blocked: chrono `DateTime` has no symbolic construction; would need an i64-ns core extraction |
+| `query::span_matches` | PROPERTY | per-filter exactness; unset filters always match; completeness | same |
+| `query::summarize_trace` | INTEGRATION (+ helpers PROPERTY) | exercised via search suites | `search.rs` tests |
+| `compact::group_spans` | PROPERTY | partition law: groups/traces ordered by first appearance, every span exactly once | `tests/prop_group.rs` |
+| compact writers (bloom/stats/manifest/pack) | INTEGRATION | byte-exact segment round-trips | `compactor.rs` tests |
+| ingest `TraceLakeDb` | INTEGRATION | write/read/isolation/100K | `db.rs` tests |
+| `get_trace` / `search_traces` / server | INTEGRATION | hot/cold merge, bloom skip proof, stats prune proof, e2e HTTP | `trace_fetch.rs`, `search.rs`, server tests |
+
+## 4. How to run
+
+```bash
+cargo test --workspace                     # everything incl. proptest suites (seconds)
+cargo kani -p tracelake-core               # PROVEN tier, core (minutes)
+cargo kani -p tracelake-query              # PROVEN tier, merge laws
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+CI runs the same: check job on every PR; a Kani job when
+`tracelake-core/**` or `tracelake-query/**` changes; Miri (nightly,
+non-blocking) on `tracelake-core`.
+
+## 5. Agent / contributor protocol (mandatory)
+
+1. **Changing a pure function in `tracelake-core` or the pure helpers in
+   `tracelake-query`** (`merge.rs`, `stats_may_overlap`, `span_matches`,
+   `summarize_trace`, `group_spans`): run `cargo test --workspace` AND the
+   relevant `cargo kani -p …` before committing. If you cannot run Kani,
+   say so in the commit message — do not claim PROVEN tier.
+2. **New pure function in those modules**: add a proptest property and, where
+   Kani can reach it, a `#[cfg(kani)]` harness in the same file. Update the
+   manifest in §3.
+3. **Bug fix in verified code**: first add the failing property (proptest or
+   Kani assertion) that reproduces the bug, then fix, then commit both
+   together. The proptest seed file this generates must be committed.
+4. **Reading failures**:
+   - proptest prints a shrunk counterexample and writes a seed to
+     `*.proptest-regressions`; rerun with `PROPTEST_SEED=<seed>` to
+     reproduce deterministically.
+   - Kani failures show a trace to the violating input; "unwinding
+     assertion" means raise `#[kani::unwind(N)]` or restructure the loop —
+     never delete the property to make it pass.
+5. **Never widen a margin, bound, or assume to make verification pass**
+   without a written justification in the harness comment.
+6. Keep harness strings fixed and small; symbolic `String`s explode solver
+   time. Symbolic numerics with `kani::assume` bounds are the pattern (see
+   `key.rs::verify`).
+
+## 6. Known verification debts
+
+- `stats_may_overlap` Kani proof pending an i64-nanosecond core extraction
+  (chrono boundary) — PROPERTY tier until then.
+- Fuzzing (cargo-fuzz targets over the three parsers) and Miri CI are
+  planned; Miri is insurance — the codebase has no `unsafe` today.
+- `summarize_trace` deserves direct PROPERTY-tier coverage once search
+  summaries stabilize.

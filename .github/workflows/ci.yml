@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  kani:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      !github.event.pull_request.draft
+    paths:
+      - "tracelake-core/**"
+      - "tracelake-query/**"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Kani proofs
+        uses: model-checking/kani-github-action@v1
+        with:
+          command: cargo kani -p tracelake-core -p tracelake-query
+
+  miri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo +nightly miri test -p tracelake-core
