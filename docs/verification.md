@@ -38,16 +38,16 @@ catches that. That is the boundary, stated plainly.
 
 | Function | Tier | Properties | Where |
 |----------|------|------------|-------|
-| `key::encode_span_key` / `decode_span_key` | PROVEN + PROPERTY | decode∘encode identity; ts ordering law; decoder totality on arbitrary bytes; accepted keys re-encode | `key.rs::verify` (Kani), `tests/prop_key.rs` |
+| `key::encode_span_key` / `decode_span_key` | PROPERTY (full keys) + PROVEN (timestamp codec core) | full-key round-trip, ordering, prefix laws on random keys; the extracted `encode_timestamp_bytes`/`parse_timestamp_digits` codec is proven for ALL non-negative i64 (round-trip, ordering, fold totality) — `format!`/std-parse/String plumbing stays out of the solver by design | `key.rs::verify` (Kani), `tests/prop_key.rs` |
 | `key::*_prefix` | PROPERTY | prefix isolation between traces; nested prefix structure | `tests/prop_key.rs` |
 | `key::encode_span_storage_key` | PROPERTY | composes with decode to span identity | `tests/prop_key.rs` |
-| `bloom::BloomFilter` insert/contains | PROVEN + PROPERTY | no false negatives (incl. after encode/decode); membership-exact round-trip | `bloom.rs::verify`, `tests/prop_bloom.rs` |
+| `bloom::BloomFilter` insert/contains | PROVEN (bit core) + PROPERTY | `bit_position` (the one expression shared by insert/contains) proven in-bounds for all double hashes and probe counts — no-false-negative is structural (same function both sides) + statistical (proptest incl. round-trip) | `bloom.rs::verify`, `tests/prop_bloom.rs` |
 | `bloom::BloomFilter::decode` | PROVEN + PROPERTY | totality on arbitrary bytes; accepted filters answer contains safely | same |
 | bloom false-positive rate | statistical | absent-key hit rate < 0.05 at 0.01 target (deterministic hasher) | `tests/prop_bloom.rs` |
-| `trace_pack::encode/decode_trace_pack` | PROVEN + PROPERTY | exact round-trip; every strict prefix rejected; totality on arbitrary bytes; restamped single-byte corruptions never panic through directory search + block read | `trace_pack.rs::verify`, `tests/prop_trace_pack.rs` |
+| `trace_pack::encode/decode_trace_pack` | PROVEN (decoder totality) + PROPERTY (round-trip) | restamped single-byte corruptions never panic through checksum, header, and directory walk (serde-free hand-built pack); exact round-trip and read_trace robustness on random corpora are proptest-tier — serde_json span payloads stay out of the solver by design | `trace_pack.rs::verify`, `tests/prop_trace_pack.rs` |
 | `TracePack::read_trace` / `trace_ids` | PROVEN + PROPERTY | only requested block decoded; sorted ids | same |
 | `segment::*` manifest types | PROPERTY | JSON round-trip equality; `next_segment_number` law; `segment_id` formatting (exhaustive 0..=999_999) | `tests/prop_segment.rs` |
-| `query::merge_spans` | PROVEN + PROPERTY | L1 empty→empty; L2 sorted output; L3 last-layer-wins; L4 no-loss/no-spurious; L5 idempotence | `merge.rs::verify`, `tests/prop_merge.rs` |
+| `query::merge_spans` | PROVEN + PROPERTY | L1 empty→empty; L2 sorted output; L3 last-layer-wins; L4 no-loss/no-spurious; L5 idempotence. Uses a deterministic hasher (`BuildHasherDefault<DefaultHasher>`) — OS-seeded `RandomState` is unprovable under Kani and made merges unreproducible | `merge.rs::verify`, `tests/prop_merge.rs` |
 | `query::stats_may_overlap` | PROPERTY | prune soundness (never skips a possibly-matching segment) | `src/search/verification.rs` — Kani blocked: chrono `DateTime` has no symbolic construction; would need an i64-ns core extraction |
 | `query::span_matches` | PROPERTY | per-filter exactness; unset filters always match; completeness | same |
 | `query::summarize_trace` | INTEGRATION (+ helpers PROPERTY) | exercised via search suites | `search.rs` tests |
@@ -99,6 +99,11 @@ non-blocking) on `tracelake-core`.
 
 - `stats_may_overlap` Kani proof pending an i64-nanosecond core extraction
   (chrono boundary) — PROPERTY tier until then.
+- Solver-cost reality: harnesses over `format!`/std-parse/serde_json/OS-seeded
+  hashing are restructured to verification cores (pure byte/int functions) —
+  this is deliberate, not a coverage cut. Remaining heavy solves
+  (timestamp round-trip/ordering, merge L3/L4, pack corruption) run in the
+  CI kani job on x86_64; local Apple-Silicon CBMC is several times slower.
 - Fuzzing (cargo-fuzz targets over the three parsers) and Miri CI are
   planned; Miri is insurance — the codebase has no `unsafe` today.
 - `summarize_trace` deserves direct PROPERTY-tier coverage once search

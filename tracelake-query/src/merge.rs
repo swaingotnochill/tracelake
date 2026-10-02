@@ -1,7 +1,14 @@
 //! Merges span layers from different sources into one ordered list.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::BuildHasherDefault;
 use tracelake_core::Span;
+
+/// Deterministic hasher for merge maps: no OS-seeded `RandomState`, so
+/// merges are reproducible and executable under the Kani model checker.
+/// Output semantics are unchanged — the merged list is sorted afterwards.
+type SpanMap<'a> = HashMap<&'a str, &'a Span, BuildHasherDefault<DefaultHasher>>;
 
 /// Merges span layers in ascending precedence order.
 ///
@@ -12,7 +19,7 @@ use tracelake_core::Span;
 /// The result is sorted by (start_time, span_id) — the same order as the
 /// storage key.
 pub fn merge_spans(layers: &[Vec<Span>]) -> Vec<Span> {
-    let mut by_span_id: HashMap<&str, &Span> = HashMap::new();
+    let mut by_span_id: SpanMap<'_> = HashMap::default();
 
     for layer in layers {
         for span in layer {
@@ -155,6 +162,7 @@ mod verify {
 
         let cold = vec![span("a", cold_nanos, false)];
         let hot = vec![span("a", hot_nanos, true)];
+        let expected_start = hot[0].start_time;
 
         let merged = merge_spans(&[cold, hot]);
 
@@ -165,7 +173,7 @@ mod verify {
             SpanStatus::Error,
             "the hot (last) layer's status must win"
         );
-        assert_eq!(merged[0].start_time, hot[0].start_time);
+        assert_eq!(merged[0].start_time, expected_start);
     }
 
     /// L4: no span is lost and no span is invented, whatever the layers hold.

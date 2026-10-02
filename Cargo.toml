@@ -17,3 +17,6 @@ rust-version.workspace = true
 [[bin]]
 name = "tracelake"
 path = "src/main.rs"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

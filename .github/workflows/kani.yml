@@ -1,0 +1,24 @@
+name: kani
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tracelake-core/**"
+      - "tracelake-query/**"
+      - ".github/workflows/kani.yml"
+  pull_request:
+    paths:
+      - "tracelake-core/**"
+      - "tracelake-query/**"
+      - ".github/workflows/kani.yml"
+
+jobs:
+  proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Kani proofs
+        uses: model-checking/kani-github-action@v1
+        with:
+          command: cargo kani -p tracelake-core -p tracelake-query

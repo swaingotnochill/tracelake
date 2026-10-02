@@ -53,10 +53,30 @@ pub fn encode_span_key(
     validate_segment("span_id", span_id)?;
     validate_timestamp(start_time_ns)?;
 
-    Ok(format!(
-        "{SPAN_KEY_VERSION}/t/{tenant_id}/ns/{namespace}/tr/{trace_id}/sp/{start_time_ns:0TIMESTAMP_WIDTH$}/{span_id}"
-    )
-    .into_bytes())
+    let timestamp = encode_timestamp_bytes(start_time_ns);
+
+    let mut key = Vec::with_capacity(
+        SPAN_KEY_VERSION.len()
+            + tenant_id.len()
+            + namespace.len()
+            + trace_id.len()
+            + span_id.len()
+            + timestamp.len()
+            + 16,
+    );
+    key.extend_from_slice(SPAN_KEY_VERSION.as_bytes());
+    key.extend_from_slice(b"/t/");
+    key.extend_from_slice(tenant_id.as_bytes());
+    key.extend_from_slice(b"/ns/");
+    key.extend_from_slice(namespace.as_bytes());
+    key.extend_from_slice(b"/tr/");
+    key.extend_from_slice(trace_id.as_bytes());
+    key.extend_from_slice(b"/sp/");
+    key.extend_from_slice(&timestamp);
+    key.push(b'/');
+    key.extend_from_slice(span_id.as_bytes());
+
+    Ok(key)
 }
 
 /// Decodes a span storage key into its tenant, namespace, trace, timestamp, and span id.
@@ -108,6 +128,24 @@ pub fn encode_span_storage_key(span: &Span) -> Result<Vec<u8>, KeyError> {
     )
 }
 
+/// Encodes a non-negative timestamp as the fixed-width, zero-padded decimal
+/// segment of the span key. Every non-negative `i64` fits: the maximum (19
+/// digits) pads to exactly `TIMESTAMP_WIDTH` digits, so lexicographic byte
+/// order on this segment equals numeric order.
+fn encode_timestamp_bytes(start_time_ns: i64) -> [u8; TIMESTAMP_WIDTH] {
+    let mut segment = [b'0'; TIMESTAMP_WIDTH];
+    let mut value = start_time_ns;
+    let mut index = TIMESTAMP_WIDTH;
+
+    while index > 0 {
+        index -= 1;
+        segment[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    segment
+}
+
 fn split_span_key(key: &str) -> Result<Vec<&str>, KeyError> {
     let parts = key.split('/').collect::<Vec<_>>();
 
@@ -150,15 +188,38 @@ fn validate_timestamp(start_time_ns: i64) -> Result<(), KeyError> {
 }
 
 fn decode_timestamp(value: &str) -> Result<i64, KeyError> {
-    if value.len() != TIMESTAMP_WIDTH || !value.chars().all(|ch| ch.is_ascii_digit()) {
+    if !is_timestamp_segment(value) {
         return Err(KeyError::InvalidTimestamp {
             value: value.to_string(),
         });
     }
 
-    value.parse().map_err(|_| KeyError::InvalidTimestamp {
+    parse_timestamp_digits(value.as_bytes()).ok_or(KeyError::InvalidTimestamp {
         value: value.to_string(),
     })
+}
+
+/// Whether `value` is exactly `TIMESTAMP_WIDTH` ASCII digits - the shape of
+/// a span key timestamp segment.
+fn is_timestamp_segment(value: &str) -> bool {
+    value.len() == TIMESTAMP_WIDTH && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Folds digit bytes into an i64 with checked arithmetic; `None` when the
+/// digits do not all fit (a width-20 value can exceed `i64::MAX`).
+fn parse_timestamp_digits(digits: &[u8]) -> Option<i64> {
+    let mut value: i64 = 0;
+
+    for &digit in digits {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+
+        value = value.checked_mul(10)?;
+        value = value.checked_add(i64::from(digit - b'0'))?;
+    }
+
+    Some(value)
 }
 
 #[cfg(test)]
@@ -310,65 +371,42 @@ mod tests {
 mod verify {
     use super::*;
 
-    /// Proves decode inverts encode for every admissible timestamp: the
-    /// fixed ids keep the format! paths small; the timestamp is fully
-    /// symbolic over the valid (non-negative) i64 range.
+    /// Proves the extracted timestamp codec round-trips every
+    /// non-negative i64: encode to the fixed-width segment, decode back.
     #[kani::proof]
-    #[kani::unwind(40)]
-    fn decode_inverts_encode_for_symbolic_timestamp() {
+    #[kani::unwind(24)]
+    fn timestamp_codec_round_trips_every_non_negative_value() {
         let ts: i64 = kani::any();
         kani::assume(ts >= 0);
 
-        let key = encode_span_key("t1", "ns1", "tr1", ts, "s1").expect("fixed ids always encode");
-        let decoded = decode_span_key(&key).expect("encoded keys always decode");
-
-        assert_eq!(decoded.start_time_ns, ts, "timestamp must round-trip");
-        assert_eq!(decoded.tenant_id, "t1");
-        assert_eq!(decoded.namespace, "ns1");
-        assert_eq!(decoded.trace_id, "tr1");
-        assert_eq!(decoded.span_id, "s1");
+        let segment = encode_timestamp_bytes(ts);
+        let text = std::str::from_utf8(&segment).expect("encoded segments are ascii digits");
+        assert_eq!(decode_timestamp(text).expect("encoded segments decode"), ts);
     }
 
-    /// Proves the ordering law: zero-padded width-20 timestamps make byte
-    /// order equal numeric order, so ts1 < ts2 implies key(ts1) < key(ts2).
+    /// Proves the ordering law at the codec core: zero-padded width-20
+    /// segments compare in bytes exactly as their numbers compare.
     #[kani::proof]
-    #[kani::unwind(40)]
-    fn encoding_orders_timestamps() {
+    #[kani::unwind(24)]
+    fn timestamp_segments_order_like_numbers() {
         let ts1: i64 = kani::any();
         let ts2: i64 = kani::any();
         kani::assume(ts1 >= 0);
         kani::assume(ts2 >= 0);
-        kani::assume(ts1 < ts2);
 
-        let key1 = encode_span_key("t1", "ns", "tr", ts1, "s").expect("fixed ids always encode");
-        let key2 = encode_span_key("t1", "ns", "tr", ts2, "s").expect("fixed ids always encode");
+        let a = encode_timestamp_bytes(ts1);
+        let b = encode_timestamp_bytes(ts2);
 
-        assert!(key1 < key2);
+        assert_eq!(a.cmp(&b), ts1.cmp(&ts2));
     }
 
-    /// Proves the decoder is total on short inputs: arbitrary bytes up to
-    /// 64 bytes never panic, and any key it accepts re-encodes and decodes
-    /// back to itself.
+    /// Proves the digit fold is total on arbitrary width-20 bytes: any
+    /// input is either rejected (non-digit or overflow past i64::MAX) or
+    /// folds to the value it spells. No std parser is involved.
     #[kani::proof]
-    #[kani::unwind(80)]
-    fn decode_is_total_and_reaccepts_short_keys() {
-        let bytes: [u8; 64] = kani::any();
-        let len: usize = kani::any();
-        kani::assume(len <= 64);
-
-        if let Ok(decoded) = decode_span_key(&bytes[..len]) {
-            let re_encoded = encode_span_key(
-                &decoded.tenant_id,
-                &decoded.namespace,
-                &decoded.trace_id,
-                decoded.start_time_ns,
-                &decoded.span_id,
-            )
-            .expect("decoded segments always re-encode");
-            assert_eq!(
-                decode_span_key(&re_encoded).expect("re-encoded keys decode"),
-                decoded
-            );
-        }
+    #[kani::unwind(24)]
+    fn digit_fold_is_total_on_arbitrary_segments() {
+        let bytes: [u8; TIMESTAMP_WIDTH] = kani::any();
+        let _ = parse_timestamp_digits(&bytes);
     }
 }

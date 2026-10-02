@@ -44,3 +44,37 @@ docs/verification.md (never delete a property to make it pass).
 - cargo-fuzz targets for the three parsers (phase 1 of the brief).
 - stats_may_overlap Kani proof behind an i64-ns core extraction.
 - summarize_trace direct property coverage.
+
+## Session 2: making the proofs actually run (completing stage 2)
+
+Kani harnesses were written but no proof had completed. Findings and fixes:
+
+1. **CI workflow invalid** (job-level `paths:` key, 0-second failure). Split
+   into `ci.yml` (check + miri) and `kani.yml` (own `on.push.paths` filter).
+2. **merge harness did not compile** (move-after-borrow) — `cfg(kani)` code
+   never builds under normal cargo; only a Kani run catches it.
+3. **Solver walls found and removed by restructuring** (each documented in
+   docs/verification.md):
+   - `format!`/std `parse` in the key path -> extracted pure
+     `encode_timestamp_bytes` + `parse_timestamp_digits`; proofs target the
+     codec core. PROVEN locally: digit-fold totality.
+   - macOS OS RNG inside `HashMap::new()` (`RandomState` -> CCRandomGenerateBytes,
+     a foreign C call Kani cannot run) blocked merge proofs -> `merge_spans`
+     now uses `BuildHasherDefault<DefaultHasher>` (deterministic, identical
+     semantics, reproducible merges).
+   - SipHash over symbolic keys exploded the SAT instance in bloom ->
+     extracted `bit_position` (shared by insert/contains, making
+     no-false-negative structural) and proved it in-bounds; hashing stays
+     out of the solver.
+   - serde_json in pack harnesses -> hand-built minimal pack bytes; the
+     corruption-totality proof covers checksum/header/directory without
+     parsing span JSON.
+4. **Locally VERIFIED (this machine)**: bloom bit-position bounds, bloom
+   decode totality, key digit-fold totality. Full-key round-trip/ordering,
+   merge L3/L4, and pack corruption solve slowly on Apple Silicon (20+
+   minutes each; bit-blasted 64-bit division chains and hashbrown insert
+   paths) — they are queued for the CI x86_64 runner, which is the
+   authoritative gate per docs/verification.md.
+5. All proptests stay green through every production change (88+ tests);
+   the byte-assembly refactor of `encode_span_key` is pinned by the
+   round-trip properties.
