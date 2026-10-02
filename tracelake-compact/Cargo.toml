@@ -14,3 +14,6 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 tracelake-core = { version = "0.1.0", path = "../tracelake-core" }
 tracelake-ingest = { version = "0.1.0", path = "../tracelake-ingest" }
+
+[dev-dependencies]
+proptest = "1.11"

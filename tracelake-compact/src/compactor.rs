@@ -5,7 +5,7 @@ use slatedb::object_store::{ObjectStore, path::Path};
 use std::sync::Arc;
 use thiserror::Error;
 use tracelake_core::{
-    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Trace, encode_trace_pack,
+    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Trace, encode_trace_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -40,6 +40,15 @@ pub struct TraceGroup {
 /// that order: tenant, namespace, trace_id, then start time, then span_id.
 pub async fn collect_traces(db: &TraceLakeDb) -> Result<Vec<TraceGroup>, CompactError> {
     let spans = db.scan_all_spans().await?;
+    Ok(group_spans(spans))
+}
+
+/// Groups spans, already in storage key order, into one [`TraceGroup`] per
+/// (tenant, namespace) run and one [`Trace`] per trace_id run inside it.
+///
+/// The grouping walks the input once and relies on the key order: every
+/// change of tenant, namespace, or trace_id starts a new group or trace.
+pub fn group_spans(spans: Vec<Span>) -> Vec<TraceGroup> {
     let mut groups: Vec<TraceGroup> = Vec::new();
 
     for span in spans {
@@ -76,7 +85,7 @@ pub async fn collect_traces(db: &TraceLakeDb) -> Result<Vec<TraceGroup>, Compact
         }
     }
 
-    Ok(groups)
+    groups
 }
 
 /// Compacts the hot store into segments on an object store.

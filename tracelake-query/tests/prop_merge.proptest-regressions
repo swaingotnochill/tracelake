@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 372c15912cb5a2f876a1446ca7ac559dbfe7c97ebca590151108ca7a098e6f0c # shrinks to specs = [[Span { tenant_id: "tenantid-1", namespace: "default", trace_id: "trace-1", span_id: "b", parent_span_id: None, span_type: Llm, name: "v0", start_time: 2026-05-28T20:26:40Z, end_time: None, status: Ok, attributes: Null, input: None, output: None, tokens: None, cost_usd: None, model: Some("gpt-4o"), provider: None, error: None, tags: [], scores: [] }, Span { tenant_id: "tenantid-1", namespace: "default", trace_id: "trace-1", span_id: "b", parent_span_id: None, span_type: Llm, name: "v1", start_time: 2026-05-28T20:26:40Z, end_time: None, status: Error, attributes: Null, input: None, output: None, tokens: None, cost_usd: None, model: None, provider: None, error: Some("boom-1"), tags: [], scores: [] }]]

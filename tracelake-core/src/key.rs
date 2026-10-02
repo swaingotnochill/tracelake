@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn span_keys_sort_by_trace_then_time_then_span_id() {
-        let mut keys = vec![
+        let mut keys = [
             encode_span_key("tenant-1", "default", "trace-2", 1, "span-1").unwrap(),
             encode_span_key("tenant-1", "default", "trace-1", 10, "span-2").unwrap(),
             encode_span_key("tenant-1", "default", "trace-1", 2, "span-1").unwrap(),

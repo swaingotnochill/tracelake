@@ -249,6 +249,9 @@ fn summarize_trace(
 }
 
 #[cfg(test)]
+mod verification;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;

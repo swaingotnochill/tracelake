@@ -349,7 +349,7 @@ fn read_array<const N: usize>(bytes: &[u8], pos: usize) -> Result<[u8; N], Trace
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::span::{SpanStatus, SpanType, TokenUsage};
+    use crate::span::{EvalScore, SpanStatus, SpanType, TokenUsage};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
@@ -467,6 +467,33 @@ mod tests {
             pack.read_trace("trace-0").expect("lookup should succeed"),
             None
         );
+    }
+
+    #[test]
+    fn float_fields_survive_a_pack_round_trip_bit_for_bit() {
+        // Regression found by the pack round-trip property: serde_json's
+        // default float parsing is best-effort, so `172.0 * 0.001` (one ULP
+        // away from the nearest double to 0.172) came back as 0.172 until the
+        // `float_roundtrip` feature was enabled.
+        let value = 172.0f64 * 0.001;
+        assert_ne!(value.to_bits(), 0.172f64.to_bits());
+
+        let mut trace = sample_trace("trace-1", &["span-1"]);
+        trace.spans[0].cost_usd = Some(value);
+        trace.spans[0].scores = vec![EvalScore {
+            name: "cost".to_string(),
+            value,
+        }];
+
+        let bytes = encode_trace_pack(std::slice::from_ref(&trace)).expect("pack should encode");
+        let pack = decode_trace_pack(&bytes).expect("pack should decode");
+        let spans = pack
+            .read_trace("trace-1")
+            .expect("lookup should succeed")
+            .expect("trace should exist");
+
+        assert_eq!(spans[0].cost_usd.map(f64::to_bits), Some(value.to_bits()));
+        assert_eq!(spans[0].scores[0].value.to_bits(), value.to_bits());
     }
 
     #[test]

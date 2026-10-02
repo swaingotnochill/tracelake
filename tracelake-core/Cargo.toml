@@ -9,5 +9,11 @@ rust-version.workspace = true
 chrono = { version = "0.4.44", features = ["serde"] }
 crc32fast = "1.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# serde_json `float_roundtrip` makes float parsing exact: without it, spans
+# read back from a pack can differ from what was written by one ULP
+# (found by the pack round-trip property; see trace_pack.rs tests).
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+proptest = "1.11"
