@@ -2377,6 +2377,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracelake-query"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "slatedb",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracelake-compact",
+ "tracelake-core",
+ "tracelake-ingest",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
