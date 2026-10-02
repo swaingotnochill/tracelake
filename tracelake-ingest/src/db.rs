@@ -1,12 +1,14 @@
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
-use tracelake_core::{Span, encode_span_storage_key, trace_prefix};
+use tracelake_core::{Span, encode_span_storage_key, namespace_prefix, trace_prefix};
 
 use std::sync::Arc;
 
 use crate::ingest::IngestError;
 
 /// Thin SlateDB wrapper for writing and reading hot trace spans.
+/// Cloning shares the same underlying SlateDB handle.
+#[derive(Clone)]
 pub struct TraceLakeDb {
     db: Db,
 }
@@ -52,22 +54,29 @@ impl TraceLakeDb {
         trace_id: &str,
     ) -> Result<Vec<Span>, IngestError> {
         let prefix = trace_prefix(tenant_id, namespace, trace_id)?;
-        let mut iter = self.db.scan_prefix(prefix).await?;
+        Self::scan_spans(&self.db, prefix).await
+    }
 
-        let mut spans = Vec::new();
-
-        while let Some(kv) = iter.next().await? {
-            let span: Span = serde_json::from_slice(&kv.value)?;
-            spans.push(span);
-        }
-
-        Ok(spans)
+    /// Reads every span for one (tenant, namespace) from the hot SlateDB
+    /// store in key order.
+    pub async fn get_namespace_spans(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<Span>, IngestError> {
+        let prefix = namespace_prefix(tenant_id, namespace)?;
+        Self::scan_spans(&self.db, prefix).await
     }
 
     /// Scans every span in the hot store in key order: tenant, namespace,
     /// trace_id, then start time, then span_id.
     pub async fn scan_all_spans(&self) -> Result<Vec<Span>, IngestError> {
-        let mut iter = self.db.scan::<Vec<u8>, _>(..).await?;
+        Self::scan_spans(&self.db, Vec::new()).await
+    }
+
+    /// Scans one key prefix and deserializes every value into a span.
+    async fn scan_spans(db: &Db, prefix: Vec<u8>) -> Result<Vec<Span>, IngestError> {
+        let mut iter = db.scan_prefix(prefix).await?;
 
         let mut spans = Vec::new();
 

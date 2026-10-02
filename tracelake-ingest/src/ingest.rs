@@ -4,7 +4,7 @@ use tracelake_core::KeyError;
 #[derive(Debug, Error)]
 /// Errors returned by TraceLake ingest operations.
 pub enum IngestError {
-    #[error("span key encoding failed")]
+    #[error("span key encoding failed: {0}")]
     Key(#[from] KeyError),
 
     #[error("span serialization failed")]

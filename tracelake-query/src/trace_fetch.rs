@@ -24,6 +24,9 @@ pub enum QueryError {
     #[error("segment read failed: {0}")]
     Segment(#[from] tracelake_compact::CompactError),
 
+    #[error("trace pack decode failed: {0}")]
+    Pack(#[from] tracelake_core::TracePackError),
+
     #[error("bloom filter decode failed: {0}")]
     Bloom(#[from] tracelake_core::BloomError),
 
@@ -38,11 +41,13 @@ pub enum QueryError {
 }
 
 /// Reads traces by merging the hot SlateDB store with compacted segments.
+/// Cloning shares the hot store and segment store handles.
+#[derive(Clone)]
 pub struct TraceLakeReader {
-    db: TraceLakeDb,
-    store: Arc<dyn ObjectStore>,
-    packs: TracePackWriter,
-    base_path: String,
+    pub(crate) db: TraceLakeDb,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) packs: TracePackWriter,
+    pub(crate) base_path: String,
 }
 
 impl TraceLakeReader {
