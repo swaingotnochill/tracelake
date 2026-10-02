@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tracelake-core", "tracelake-ingest", "tracelake-compact", "tracelake-query"]
+members = ["tracelake-core", "tracelake-ingest", "tracelake-compact", "tracelake-query", "tracelake-server"]
 
 [workspace.package]
 edition = "2024"

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracelake_core::{Span, decode_trace_pack};
 
 /// Reads traces back from segment trace packs on the object store.
+#[derive(Clone)]
 pub struct TracePackWriter {
     store: Arc<dyn ObjectStore>,
 }
