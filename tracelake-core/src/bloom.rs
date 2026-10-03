@@ -116,10 +116,15 @@ impl BloomFilter {
             });
         }
 
-        let bits = words_bytes
-            .chunks_exact(8)
-            .map(|word| u64::from_le_bytes(word.try_into().expect("8 byte chunk")))
-            .collect();
+        let mut bits = Vec::with_capacity(word_count);
+        let mut offset = 12;
+        while offset + 8 <= bytes.len() {
+            let word: [u8; 8] = bytes[offset..offset + 8]
+                .try_into()
+                .expect("word count validation guarantees 8-byte chunks");
+            bits.push(u64::from_le_bytes(word));
+            offset += 8;
+        }
 
         Ok(Self {
             bits,
