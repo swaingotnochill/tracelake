@@ -394,7 +394,14 @@ fn bench_record(segment: usize, index: usize) -> Record {
     Record::new()
         .set("sample_id", json!(format!("seg{segment}-rec{index:05}")))
         .set("eval_id", json!("eval-bench"))
-        .set("task", json!(if index.is_multiple_of(2) { "gsm8k" } else { "math" }))
+        .set(
+            "task",
+            json!(if index.is_multiple_of(2) {
+                "gsm8k"
+            } else {
+                "math"
+            }),
+        )
         .set("model", json!("openai/gpt-4o"))
         .set("epoch", json!(1))
         .set(
