@@ -1,8 +1,8 @@
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
 use tracelake_core::{
-    Record, Span, TableSchema, decode_record_key, encode_record_key, encode_span_storage_key,
-    namespace_prefix, record_prefix, span_root_prefix, trace_prefix,
+    KeyError, Record, Span, TableSchema, decode_record_key, encode_record_key,
+    encode_span_storage_key, namespace_prefix, record_prefix, span_root_prefix, trace_prefix,
 };
 
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use crate::ingest::IngestError;
 /// One hot record plus the table coordinates decoded from its key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRecord {
+    /// Full storage key, used as the compaction watermark.
+    pub key: String,
     pub tenant_id: String,
     pub namespace: String,
     pub table: String,
@@ -74,6 +76,23 @@ impl TraceLakeDb {
         Self::scan_spans(&self.db, prefix).await
     }
 
+    /// Deletes keys after their contents are published in a segment. The
+    /// manifest publish is the commit point, so a crash before this call leaves
+    /// duplicates that the next compaction's watermark skips.
+    pub async fn delete_keys(&self, keys: &[Vec<u8>]) -> Result<(), IngestError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for key in keys {
+            batch.delete(key.clone());
+        }
+        self.db.write(batch).await?;
+
+        Ok(())
+    }
+
     /// Reads every span for one (tenant, namespace) from the hot SlateDB
     /// store in key order.
     pub async fn get_namespace_spans(
@@ -88,7 +107,26 @@ impl TraceLakeDb {
     /// Scans every span in the hot store in key order: tenant, namespace,
     /// trace_id, then start time, then span_id.
     pub async fn scan_all_spans(&self) -> Result<Vec<Span>, IngestError> {
-        Self::scan_spans(&self.db, span_root_prefix().to_vec()).await
+        Ok(self
+            .scan_all_spans_with_keys()
+            .await?
+            .into_iter()
+            .map(|(_, span)| span)
+            .collect())
+    }
+
+    /// Scans every span with its storage key. The compactor uses the last key
+    /// of a namespace as its watermark.
+    pub async fn scan_all_spans_with_keys(&self) -> Result<Vec<(String, Span)>, IngestError> {
+        let mut iter = self.db.scan_prefix(span_root_prefix().to_vec()).await?;
+        let mut spans = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8(kv.key.to_vec()).map_err(|_| KeyError::InvalidUtf8)?;
+            spans.push((key, serde_json::from_slice(&kv.value)?));
+        }
+
+        Ok(spans)
     }
 
     /// Validates each record against `schema` and writes them in one batch.
@@ -159,6 +197,7 @@ impl TraceLakeDb {
         while let Some(kv) = iter.next().await? {
             let key = decode_record_key(&kv.key)?;
             records.push(StoredRecord {
+                key: String::from_utf8(kv.key.to_vec()).map_err(|_| KeyError::InvalidUtf8)?,
                 tenant_id: key.tenant_id,
                 namespace: key.namespace,
                 table: key.table,

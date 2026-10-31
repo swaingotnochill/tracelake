@@ -727,9 +727,7 @@ mod tests {
             .iter()
             .find(|row| row["severity"] == "high")
             .expect("high row");
-        // Compaction currently rescans hot data, so the first record appears in
-        // both segments. The property under test is the missing column.
-        assert!(high["count"].as_u64().unwrap_or(0) >= 1);
+        assert_eq!(high["count"], 1);
         assert!(high["avg_confidence"].is_null());
 
         let low = rows
@@ -738,6 +736,106 @@ mod tests {
             .expect("low row");
         assert_eq!(low["count"], 1);
         assert_eq!(low["avg_confidence"], 0.9);
+    }
+
+    #[tokio::test]
+    async fn repeat_compaction_writes_nothing_and_does_not_duplicate_results() {
+        let app = build_router(test_state().await);
+
+        let mut first = example_span("trace-1", "span-a", 1);
+        first.model = Some("gpt-4o".to_string());
+        first.end_time = Some(first.start_time + chrono::Duration::milliseconds(100));
+        let mut second = example_span("trace-1", "span-b", 2);
+        second.model = Some("gpt-4o".to_string());
+        second.end_time = Some(second.start_time + chrono::Duration::milliseconds(200));
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": [first, second] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let schema = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(schema),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-1" }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["segments"], json!(["segment-000001"]));
+        assert_eq!(body["record_segments"], json!(["segment-000001"]));
+
+        let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["segments"], json!([]));
+        assert_eq!(body["record_segments"], json!([]));
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["spans"].as_array().map(Vec::len), Some(2));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans/aggregate",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "metrics": ["count"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"][0]["count"], 2);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({ "limit": 10 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/aggregate",
+            Some(json!({ "metrics": ["count"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"][0]["count"], 1);
     }
 
     #[tokio::test]

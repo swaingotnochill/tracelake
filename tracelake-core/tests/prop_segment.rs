@@ -184,14 +184,16 @@ fn manifest() -> impl Strategy<Value = SegmentManifest> {
         small_string(),
         small_string(),
         prop::option::of(small_string()),
+        prop::option::of(small_string()),
         prop::collection::vec(entry(), 0..=4),
     )
         .prop_map(
-            |(version, tenant_id, namespace, table, segments)| SegmentManifest {
+            |(version, tenant_id, namespace, table, watermark, segments)| SegmentManifest {
                 version,
                 tenant_id,
                 namespace,
                 table,
+                watermark,
                 segments,
             },
         )

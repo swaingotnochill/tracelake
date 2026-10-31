@@ -15,7 +15,7 @@ pub mod trace_pack_writer;
 
 pub use bloom_writer::{build_record_bloom, build_segment_bloom};
 pub use column_writer::{build_record_batch, build_span_batch, encode_parquet};
-pub use compactor::{CompactError, Compactor, TraceGroup, collect_traces, group_spans};
+pub use compactor::{CompactError, Compactor, TraceGroup, group_spans};
 pub use manifest_writer::{publish_manifest, read_manifest, read_record_manifest};
 pub use record_compactor::{RecordCompactor, RecordGroup, collect_record_groups};
 pub use record_pack_reader::RecordPackReader;

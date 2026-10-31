@@ -44,11 +44,11 @@ rather than segment size. See [performance.md](../performance.md).
 
 ## Gaps that matter for alpha
 
-1. **Compaction repeats work.** The compactor scans the whole hot store on every
-   run, and hot data is not removed after compaction. Segments therefore
-   duplicate records, and queries deduplicate them. This is correct but grows
-   storage and wastes compaction time. Alpha needs a per-namespace watermark and
-   a drop step for compacted hot keys.
+1. **Compaction is single-threaded and has no scheduler.** It now compacts only
+   keys above a per-namespace watermark and deletes those hot keys, so repeat
+   runs do no work and segments hold each record once. The first compaction still
+   builds one segment from the whole hot buffer. Late keys below the watermark
+   stay in the hot store.
 2. **No deletes or retention.** There is no way to remove a trace. A regulated
    deployment cannot use the alpha until this exists.
 3. **Analytics are incomplete.** Aggregation over Parquet columns is landing in

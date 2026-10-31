@@ -194,7 +194,7 @@ async fn stats_pruning_skips_segments_the_filter_cannot_match() {
         .collect();
     compact(&store, &low).await;
     let high: Vec<Record> = (0..4)
-        .map(|index| record(&format!("high-{index}"), "math", 0.9))
+        .map(|index| record(&format!("z-high-{index}"), "math", 0.9))
         .collect();
     compact(&store, &high).await;
 

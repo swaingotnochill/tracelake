@@ -1,13 +1,14 @@
 use crate::bloom_writer::build_record_bloom;
 use crate::compactor::CompactError;
-use crate::manifest_writer::publish_manifest;
+use crate::manifest_writer::{publish_manifest, read_record_manifest};
 use crate::record_stats_writer::build_record_stats;
 use crate::schema_store::{put_schema, read_schema};
 use slatedb::object_store::{ObjectStore, path::Path};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracelake_core::{
     Record, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, TableSchema,
-    encode_record_pack,
+    encode_record_key, encode_record_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -22,16 +23,45 @@ pub struct RecordGroup {
     pub records: Vec<Record>,
 }
 
-/// Groups hot records by table and loads each table's registered schema.
+/// Groups hot records by table, skipping keys at or below each table's
+/// watermark, and returns the last kept key per group.
 pub async fn collect_record_groups(
     db: &TraceLakeDb,
     store: &Arc<dyn ObjectStore>,
     base_path: &str,
-) -> Result<Vec<RecordGroup>, CompactError> {
-    let mut groups: Vec<RecordGroup> = Vec::new();
+) -> Result<Vec<(RecordGroup, String)>, CompactError> {
+    let mut groups: Vec<(RecordGroup, String)> = Vec::new();
+    let mut known: HashMap<(String, String, String), Option<String>> = HashMap::new();
 
     for stored in db.scan_all_records().await? {
-        let same_group = groups.last().is_some_and(|group| {
+        let location = (
+            stored.tenant_id.clone(),
+            stored.namespace.clone(),
+            stored.table.clone(),
+        );
+
+        if !known.contains_key(&location) {
+            let manifest = read_record_manifest(
+                store,
+                base_path,
+                &stored.tenant_id,
+                &stored.namespace,
+                &stored.table,
+            )
+            .await?;
+            known.insert(
+                location.clone(),
+                manifest.and_then(|manifest| manifest.watermark),
+            );
+        }
+
+        if let Some(watermark) = known.get(&location).and_then(Option::as_deref)
+            && stored.key.as_str() <= watermark
+        {
+            continue;
+        }
+
+        let same_group = groups.last().is_some_and(|(group, _)| {
             group.tenant_id == stored.tenant_id
                 && group.namespace == stored.namespace
                 && group.table == stored.table
@@ -50,17 +80,21 @@ pub async fn collect_record_groups(
                 table: stored.table.clone(),
             })?;
 
-            groups.push(RecordGroup {
-                tenant_id: stored.tenant_id.clone(),
-                namespace: stored.namespace.clone(),
-                table: stored.table.clone(),
-                schema,
-                records: Vec::new(),
-            });
+            groups.push((
+                RecordGroup {
+                    tenant_id: stored.tenant_id.clone(),
+                    namespace: stored.namespace.clone(),
+                    table: stored.table.clone(),
+                    schema,
+                    records: Vec::new(),
+                },
+                stored.key.clone(),
+            ));
         }
 
-        if let Some(group) = groups.last_mut() {
+        if let Some((group, last)) = groups.last_mut() {
             group.records.push(stored.record);
+            *last = stored.key;
         }
     }
 
@@ -86,14 +120,19 @@ impl RecordCompactor {
         let groups = collect_record_groups(db, &self.store, &self.base_path).await?;
 
         let mut written = Vec::with_capacity(groups.len());
-        for group in &groups {
-            written.push(self.compact_group(group).await?);
+        for (group, watermark) in &groups {
+            written.push(self.compact_group(db, group, watermark).await?);
         }
 
         Ok(written)
     }
 
-    async fn compact_group(&self, group: &RecordGroup) -> Result<SegmentEntry, CompactError> {
+    async fn compact_group(
+        &self,
+        db: &TraceLakeDb,
+        group: &RecordGroup,
+        watermark: &str,
+    ) -> Result<SegmentEntry, CompactError> {
         let schema = put_schema(
             &self.store,
             &self.base_path,
@@ -165,7 +204,28 @@ impl RecordCompactor {
         };
 
         manifest.segments.push(entry.clone());
+        manifest.watermark = Some(watermark.to_string());
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
+
+        let keys = group
+            .records
+            .iter()
+            .map(|record| {
+                schema
+                    .record_id(record)
+                    .map_err(CompactError::Record)
+                    .and_then(|record_id| {
+                        encode_record_key(
+                            &group.tenant_id,
+                            &group.namespace,
+                            &group.table,
+                            &record_id,
+                        )
+                        .map_err(CompactError::Key)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        db.delete_keys(&keys).await?;
 
         Ok(entry)
     }
@@ -198,5 +258,63 @@ impl RecordCompactor {
             size_bytes,
             crc32,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tracelake_core::{FieldType, Record, TableSchema};
+
+    const BASE_PATH: &str = "tracelake/segments";
+
+    #[tokio::test]
+    async fn a_second_record_compaction_without_new_records_writes_nothing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let schema = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .primary_key("id")
+            .build()
+            .expect("schema builds");
+        crate::schema_store::put_schema(&store, BASE_PATH, "tenant-1", "default", &schema)
+            .await
+            .expect("schema registers");
+
+        let db = TraceLakeDb::open_in_memory("/record-watermark")
+            .await
+            .expect("db should open");
+        let records: Vec<Record> = (0..2)
+            .map(|index| Record::new().set("id", json!(format!("record-{index}"))))
+            .collect();
+        db.put_records("tenant-1", "default", &schema, &records)
+            .await
+            .expect("records should write");
+
+        let compactor = RecordCompactor::new(Arc::clone(&store), BASE_PATH);
+        let first = compactor
+            .compact(&db)
+            .await
+            .expect("compaction should succeed");
+        assert_eq!(first.len(), 1);
+
+        let manifest = read_record_manifest(&store, BASE_PATH, "tenant-1", "default", "notes")
+            .await
+            .expect("manifest should read")
+            .expect("manifest should exist");
+        let watermark = manifest.watermark.expect("watermark is set");
+        assert!(watermark.ends_with("record-1"));
+
+        assert!(
+            db.scan_all_records().await.expect("scan").is_empty(),
+            "compacted hot keys are dropped"
+        );
+
+        let second = compactor
+            .compact(&db)
+            .await
+            .expect("second compaction should succeed");
+        assert!(second.is_empty(), "nothing new to compact");
+        assert_eq!(manifest.segments.len(), 1);
     }
 }

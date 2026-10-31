@@ -70,9 +70,10 @@ That is about 60 times faster at 46 MB, and the cost now follows the trace.
 - **Search reads whole packs.** A structural search decodes every matching
   segment pack, so its cost follows segment size. Pruning by stats and time is
   what keeps it bounded. Column files and per-field indexes would remove this.
-- **Compaction is single-threaded and rescans the hot store.** One compactor
-  run builds one segment, so segment size follows the hot buffer. The
-  compaction watermark is the top alpha fix.
+- **Compaction is single-threaded and has no scheduler.** It compacts only keys
+  above the namespace watermark and deletes those hot keys, so repeat runs do no
+  work. One run still builds one segment, so segment size follows the hot
+  buffer.
 - **Text search over hot data builds an index per query.** It is correct, not
   cheap. Compaction moves data into indexed segments, after which text search
   reads one segment index object per segment.

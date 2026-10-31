@@ -33,23 +33,21 @@ is explicitly out of scope.
 | Tenant isolation at the key and path level | Yes | Isolation tests |
 | A single process can restart without data loss | Yes | Restart test |
 | Request size is bounded | Yes | 32 MiB body limit |
-| Compaction does not duplicate records | No | Hot keys are not dropped |
+| Compaction does not duplicate records | Yes | Watermark plus hot-key deletion; repeat-compaction test |
 | Deletes and retention exist | No | Alpha blocker for regulated data |
 | Authentication exists | No | Loopback bind only |
 | Query timeouts and limits exist | No | Broad queries can run long |
 
 ## Required before the alpha tag
 
-1. Compaction watermark and hot-key drop, so a second compaction does not copy
-   the same records into a new segment.
-2. A delete path with tombstones that survive compaction and retention windows.
-3. A query timeout and a per-tenant concurrency cap.
-4. S3 and GCS wiring in the server. Only the local file-system store is wired
+1. A delete path with tombstones that survive compaction and retention windows.
+2. A query timeout and a per-tenant concurrency cap.
+3. S3 and GCS wiring in the server. Only the local file-system store is wired
    today, although every store path goes through `object_store`.
-5. A dependency audit job in CI.
+4. A dependency audit job in CI.
 
-Items 1 and 2 are the ones that change the storage format, so they should land
-before any external alpha user writes data.
+The delete path changes the storage format, so it should land before any
+external alpha user writes data.
 
 ## Operational notes
 
@@ -58,7 +56,13 @@ before any external alpha user writes data.
 - One server process owns a data directory. Two processes against one directory
   are untested.
 - Compaction is triggered by `POST /v1/compact`; there is no background scheduler
-  yet.
+  yet. It compacts keys above each namespace watermark, publishes the segment,
+  then deletes those hot keys. A crash between publish and delete leaves
+  duplicates that the watermark skips on the next run.
+- A span or record that arrives with a key below the watermark stays in the hot
+  store and is served from there. It is not copied into a segment. This keeps
+  late data readable while hot data is retained, and is a limitation once hot
+  retention exists.
 - Bind to loopback or a private network. There is no authentication.
 
 ## Out of scope for alpha

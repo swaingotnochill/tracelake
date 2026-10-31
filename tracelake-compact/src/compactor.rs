@@ -2,10 +2,12 @@ use crate::bloom_writer::build_segment_bloom;
 use crate::manifest_writer::{publish_manifest, read_manifest};
 use crate::stats_writer::build_segment_stats;
 use slatedb::object_store::{ObjectStore, path::Path};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracelake_core::{
-    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Trace, encode_trace_pack,
+    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Trace,
+    encode_span_storage_key, encode_trace_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -62,15 +64,6 @@ pub struct TraceGroup {
     pub tenant_id: String,
     pub namespace: String,
     pub traces: Vec<Trace>,
-}
-
-/// Scans the hot store and groups spans into traces per tenant and namespace.
-///
-/// Spans arrive in storage key order, so groups, traces, and spans all keep
-/// that order: tenant, namespace, trace_id, then start time, then span_id.
-pub async fn collect_traces(db: &TraceLakeDb) -> Result<Vec<TraceGroup>, CompactError> {
-    let spans = db.scan_all_spans().await?;
-    Ok(group_spans(spans))
 }
 
 /// Groups spans, already in storage key order, into one [`TraceGroup`] per
@@ -139,20 +132,67 @@ impl Compactor {
         }
     }
 
-    /// Compacts every span in the hot store, returning the manifest entries
-    /// written, one segment per (tenant, namespace).
+    /// Compacts every span written since the last compaction, returning the
+    /// manifest entries written, one segment per (tenant, namespace).
     pub async fn compact(&self, db: &TraceLakeDb) -> Result<Vec<SegmentEntry>, CompactError> {
-        let groups = collect_traces(db).await?;
+        let (groups, watermarks) = self.collect_pending(db).await?;
 
         let mut written = Vec::with_capacity(groups.len());
         for group in &groups {
-            written.push(self.compact_group(group).await?);
+            let namespace = (group.tenant_id.clone(), group.namespace.clone());
+            let watermark = watermarks.get(&namespace).map(String::as_str);
+            written.push(self.compact_group(db, group, watermark).await?);
         }
 
         Ok(written)
     }
 
-    async fn compact_group(&self, group: &TraceGroup) -> Result<SegmentEntry, CompactError> {
+    /// Reads spans above each namespace's watermark and groups the survivors.
+    /// The last key kept per namespace becomes the next watermark.
+    async fn collect_pending(
+        &self,
+        db: &TraceLakeDb,
+    ) -> Result<(Vec<TraceGroup>, HashMap<(String, String), String>), CompactError> {
+        let mut known: HashMap<(String, String), Option<String>> = HashMap::new();
+        let mut last: HashMap<(String, String), String> = HashMap::new();
+        let mut kept = Vec::new();
+
+        for (key, span) in db.scan_all_spans_with_keys().await? {
+            let namespace = (span.tenant_id.clone(), span.namespace.clone());
+
+            if !known.contains_key(&namespace) {
+                let manifest = read_manifest(
+                    &self.store,
+                    &self.base_path,
+                    &span.tenant_id,
+                    &span.namespace,
+                )
+                .await?;
+                known.insert(
+                    namespace.clone(),
+                    manifest.and_then(|manifest| manifest.watermark),
+                );
+            }
+
+            if let Some(watermark) = known.get(&namespace).and_then(Option::as_deref)
+                && key.as_str() <= watermark
+            {
+                continue;
+            }
+
+            last.insert(namespace, key);
+            kept.push(span);
+        }
+
+        Ok((group_spans(kept), last))
+    }
+
+    async fn compact_group(
+        &self,
+        db: &TraceLakeDb,
+        group: &TraceGroup,
+        watermark: Option<&str>,
+    ) -> Result<SegmentEntry, CompactError> {
         let mut manifest = read_manifest(
             &self.store,
             &self.base_path,
@@ -227,7 +267,16 @@ impl Compactor {
         };
 
         manifest.segments.push(entry.clone());
+        manifest.watermark = watermark.map(str::to_string);
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
+
+        let keys = group
+            .traces
+            .iter()
+            .flat_map(|trace| trace.spans.iter())
+            .map(encode_span_storage_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        db.delete_keys(&keys).await?;
 
         Ok(entry)
     }
@@ -351,7 +400,11 @@ mod tests {
         .await
         .expect("spans should write");
 
-        let groups = collect_traces(&db).await.expect("traces should collect");
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (groups, _) = Compactor::new(store, BASE_PATH)
+            .collect_pending(&db)
+            .await
+            .expect("traces should collect");
 
         assert_eq!(
             summarize(&groups),
@@ -373,7 +426,11 @@ mod tests {
             .await
             .expect("db should open");
 
-        let groups = collect_traces(&db).await.expect("traces should collect");
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (groups, _) = Compactor::new(store, BASE_PATH)
+            .collect_pending(&db)
+            .await
+            .expect("traces should collect");
 
         assert!(groups.is_empty());
     }
@@ -539,6 +596,50 @@ mod tests {
 
         let spans_per_second = SPAN_COUNT as f64 / compact_elapsed.as_secs_f64();
         println!("10K segment check: compact={compact_elapsed:?} ({spans_per_second:.0} spans/s)");
+    }
+
+    #[tokio::test]
+    async fn a_second_compaction_without_new_spans_writes_nothing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = TraceLakeDb::open_in_memory("/test-watermark")
+            .await
+            .expect("db should open");
+        db.put_spans(&[scale_span(0, 0), scale_span(1, 0)])
+            .await
+            .expect("spans should write");
+
+        let compactor = Compactor::new(Arc::clone(&store), BASE_PATH);
+        let first = compactor
+            .compact(&db)
+            .await
+            .expect("compaction should succeed");
+        assert_eq!(first.len(), 1);
+
+        let manifest = read_manifest(&store, BASE_PATH, "tenantid-1", "default")
+            .await
+            .expect("manifest should read")
+            .expect("manifest should exist");
+        let watermark = manifest.watermark.expect("watermark is set");
+        assert!(watermark.contains("trace-001"));
+        assert!(watermark.ends_with("span-000"));
+
+        assert!(
+            db.scan_all_spans().await.expect("scan").is_empty(),
+            "compacted hot keys are dropped"
+        );
+
+        let second = compactor
+            .compact(&db)
+            .await
+            .expect("second compaction should succeed");
+        assert!(second.is_empty(), "nothing new to compact");
+
+        let manifest = read_manifest(&store, BASE_PATH, "tenantid-1", "default")
+            .await
+            .expect("manifest should read")
+            .expect("manifest should exist");
+        assert_eq!(manifest.watermark, Some(watermark));
+        assert_eq!(manifest.segments.len(), 1);
     }
 
     #[tokio::test]

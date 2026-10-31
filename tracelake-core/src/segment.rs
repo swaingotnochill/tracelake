@@ -12,6 +12,10 @@ pub struct SegmentManifest {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
+    /// Last storage key compacted for this namespace or table. A later
+    /// compaction only reads keys above it, so records are not copied twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<String>,
     /// Every published segment, oldest first.
     pub segments: Vec<SegmentEntry>,
 }
@@ -160,6 +164,7 @@ impl SegmentManifest {
             tenant_id: tenant_id.into(),
             namespace: namespace.into(),
             table: None,
+            watermark: None,
             segments: Vec::new(),
         }
     }
