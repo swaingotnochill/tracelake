@@ -156,6 +156,10 @@ its own field list. Changing a field's type needs a new table.
 per sample. See [docs/schemas.md](docs/schemas.md) for field types, storage layout, query
 semantics, pruning rules, and measured costs.
 
+A runnable example, a real inspect-ai eval against GLM-4.7 plus the database queries on
+its log, is in [examples/inspect-ai-evals](examples/inspect-ai-evals). Run
+`examples/inspect-ai-evals/run.sh` to regenerate the log and the query output.
+
 ## Architecture
 
 Database decisions, storage layout, key encoding, read/write paths, and every

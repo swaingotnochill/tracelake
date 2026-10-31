@@ -239,8 +239,24 @@ fn score_column(sample: &EvalSample, scorer: Option<&str>) -> (Option<String>, O
     };
 
     match selected {
-        Some((name, score)) => (Some(name.clone()), score.value.as_f64()),
+        Some((name, score)) => (Some(name.clone()), score_number(&score.value)),
         None => (None, None),
+    }
+}
+
+/// inspect-ai stores a pass/fail as "C", "I", or "P" and a graded score as a
+/// number or a numeric string. The typed column needs one number.
+fn score_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
+        Value::String(text) => match text.as_str() {
+            "C" | "correct" => Some(1.0),
+            "I" | "incorrect" => Some(0.0),
+            "P" | "partial" => Some(0.5),
+            other => other.parse().ok(),
+        },
+        _ => None,
     }
 }
 
@@ -273,7 +289,7 @@ mod tests {
                     "target": "4",
                     "output": { "model": "openai/gpt-4o", "completion": "4" },
                     "scores": {
-                        "accuracy": { "value": 1.0, "answer": "4", "explanation": "matches" },
+                        "accuracy": { "value": "C", "answer": "4", "explanation": "matches" },
                         "partial": { "value": 0.5 }
                     },
                     "metadata": { "trace_id": "trace-17" },
@@ -350,6 +366,26 @@ mod tests {
         assert_eq!(records[0].get("scorer"), Some(&json!("partial")));
         assert_eq!(records[0].get("score"), Some(&json!(0.5)));
         assert!(records[1].get("score").is_none());
+    }
+
+    #[test]
+    fn scorer_sentinels_and_numeric_strings_become_numbers() {
+        let mut log = example_log();
+        log.samples[0].scores.get_mut("accuracy").unwrap().value = json!("I");
+        let records = sample_records(&log, Some("accuracy")).unwrap();
+        assert_eq!(records[0].get("score"), Some(&json!(0.0)));
+
+        log.samples[0].scores.get_mut("accuracy").unwrap().value = json!("P");
+        let records = sample_records(&log, Some("accuracy")).unwrap();
+        assert_eq!(records[0].get("score"), Some(&json!(0.5)));
+
+        log.samples[0].scores.get_mut("accuracy").unwrap().value = json!("0.25");
+        let records = sample_records(&log, Some("accuracy")).unwrap();
+        assert_eq!(records[0].get("score"), Some(&json!(0.25)));
+
+        log.samples[0].scores.get_mut("accuracy").unwrap().value = json!("not a score");
+        let records = sample_records(&log, Some("accuracy")).unwrap();
+        assert!(records[0].get("score").is_none());
     }
 
     #[test]

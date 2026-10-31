@@ -180,7 +180,7 @@ one row per sample. The adapter accepts the inspect-ai JSON shape: `eval` with `
 | `epoch` | i64 | sample |
 | `status` | string | `error` when the sample has an error, else `success` |
 | `error` | string | sample error |
-| `scorer`, `score` | string, f64 | one scorer: the named one, or the first by name |
+| `scorer`, `score` | string, f64 | one scorer: the named one, or the first by name. inspect-ai pass, fail, and partial sentinels (`C`, `I`, `P`) map to 1.0, 0.0, and 0.5 |
 | `total_tokens` | i64 | sum of `model_usage.*.total_tokens` |
 | `total_time_s` | f64 | `total_time` |
 | `completed_at` | timestamp | `completed_at` as nanoseconds |
