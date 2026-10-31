@@ -2,7 +2,9 @@
 
 use slatedb::object_store::local::LocalFileSystem;
 use std::sync::Arc;
+use std::time::Duration;
 use tracelake_ingest::TraceLakeDb;
+use tracelake_server::limits::Limits;
 use tracelake_server::{AppState, build_router};
 
 /// Address the server binds when `TRACELAKE_ADDR` is unset. Loopback is the
@@ -32,7 +34,11 @@ async fn main() {
         .await
         .expect("hot store should open");
 
-    let state = AppState::new(db, store, SEGMENT_PATH);
+    let limits = Limits {
+        query_timeout: Duration::from_millis(env_u64("TRACELAKE_QUERY_TIMEOUT_MS", 30_000)),
+        max_concurrent_per_tenant: env_u64("TRACELAKE_TENANT_CONCURRENCY", 16) as usize,
+    };
+    let state = AppState::with_limits(db, store, SEGMENT_PATH, limits);
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -41,6 +47,11 @@ async fn main() {
 
     println!("tracelake listening on http://{addr}");
     println!("data directory: {data_dir}");
+    println!(
+        "limits: query timeout {} ms, {} concurrent reads per tenant",
+        limits.query_timeout.as_millis(),
+        limits.max_concurrent_per_tenant
+    );
     println!("endpoints:");
     println!("  POST /v1/spans                                  ingest a batch of spans");
     println!("  POST /v1/compact                                compact the hot store");
@@ -50,4 +61,11 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("server should serve");
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }

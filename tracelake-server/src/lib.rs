@@ -1,9 +1,11 @@
 //! HTTP API: ingest, compaction, trace fetch, and search endpoints.
 
 pub mod ingest_handler;
+pub mod limits;
 pub mod query_handler;
 pub mod table_handler;
 
+use limits::{Limits, TenantLimiter};
 use slatedb::object_store::ObjectStore;
 use std::sync::Arc;
 use tracelake_ingest::TraceLakeDb;
@@ -22,18 +24,30 @@ pub struct AppState {
     pub store: Arc<dyn ObjectStore>,
     pub reader: TraceLakeReader,
     pub base_path: String,
+    pub limits: Arc<TenantLimiter>,
 }
 
 impl AppState {
     /// Builds state over one hot store and one segment store; `base_path`
     /// must match the compactor's, e.g. `tracelake/segments`.
     pub fn new(db: TraceLakeDb, store: Arc<dyn ObjectStore>, base_path: &str) -> Self {
+        Self::with_limits(db, store, base_path, Limits::default())
+    }
+
+    /// Builds state with explicit read limits.
+    pub fn with_limits(
+        db: TraceLakeDb,
+        store: Arc<dyn ObjectStore>,
+        base_path: &str,
+        limits: Limits,
+    ) -> Self {
         let reader = TraceLakeReader::new(db.clone(), Arc::clone(&store), base_path);
         Self {
             db,
             store,
             reader,
             base_path: base_path.to_string(),
+            limits: Arc::new(TenantLimiter::new(limits)),
         }
     }
 }
@@ -133,10 +147,14 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
+        test_state_with_limits(crate::limits::Limits::default()).await
+    }
+
+    async fn test_state_with_limits(limits: crate::limits::Limits) -> AppState {
         let db = tracelake_ingest::TraceLakeDb::open_in_memory("/server-test")
             .await
             .expect("db should open");
-        AppState::new(db, Arc::new(InMemory::new()), BASE_PATH)
+        AppState::with_limits(db, Arc::new(InMemory::new()), BASE_PATH, limits)
     }
 
     async fn call(
@@ -420,6 +438,51 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn over_limit_queries_are_rejected_with_429() {
+        let app = build_router(
+            test_state_with_limits(crate::limits::Limits {
+                query_timeout: std::time::Duration::from_secs(5),
+                max_concurrent_per_tenant: 0,
+            })
+            .await,
+        );
+
+        for (method, uri, body) in [
+            ("GET", "/v1/traces/tenantid-1/default/trace-1", None),
+            (
+                "POST",
+                "/v1/spans/aggregate",
+                Some(json!({
+                    "tenant_id": "tenantid-1",
+                    "namespace": "default",
+                    "metrics": ["count"]
+                })),
+            ),
+            (
+                "POST",
+                "/v1/tables/tenantid-1/default/findings/query",
+                Some(json!({ "limit": 10 })),
+            ),
+        ] {
+            let (status, _) = call(app.clone(), method, uri, body).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{method} {uri}");
+        }
+
+        let (status, _) = call(
+            build_router(test_state().await),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-absent",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a normal request still reaches the database"
+        );
     }
 
     #[tokio::test]

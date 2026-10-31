@@ -20,6 +20,7 @@ is explicitly out of scope.
 | Ingest inspect-ai evals | `POST /v1/evals` | `inspect_ai.rs`, example log |
 | Delete a trace or record | `DELETE /v1/traces/...`, `DELETE .../records/{id}` | delete e2e test |
 | Retention | `POST /v1/retention` with a cutoff | retention test |
+| Read limits | timeout and per-tenant cap | limiter unit tests, 429 e2e test |
 | Durable local storage | `TRACELAKE_DATA_DIR` | restart test |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 
@@ -35,6 +36,8 @@ is explicitly out of scope.
 | Tenant isolation at the key and path level | Yes | Isolation tests |
 | A single process can restart without data loss | Yes | Restart test |
 | Request size is bounded | Yes | 32 MiB body limit |
+| A read cannot run forever | Yes | 30 s query timeout, 504 on expiry |
+| One tenant cannot starve others | Yes | 16 concurrent reads per tenant, 429 above it |
 | Compaction does not duplicate records | Yes | Watermark plus hot-key deletion; repeat-compaction test |
 | Deletes and retention exist | Yes | Tombstones mask compacted copies; delete and retention tests |
 | Authentication exists | No | Loopback bind only |
@@ -42,16 +45,20 @@ is explicitly out of scope.
 
 ## Required before the alpha tag
 
-1. A query timeout and a per-tenant concurrency cap.
-2. S3 and GCS wiring in the server. Only the local file-system store is wired
+1. S3 and GCS wiring in the server. Only the local file-system store is wired
    today, although every store path goes through `object_store`.
-3. A dependency audit job in CI.
-4. Segment rewrite so deleted rows stop consuming space. Deletes are logically
+2. A dependency audit job in CI.
+3. Segment rewrite so deleted rows stop consuming space. Deletes are logically
    correct today; tombstones accumulate in the manifest and old segments keep
    the deleted bytes.
 
 ## Operational notes
 
+- Read limits are set by `TRACELAKE_QUERY_TIMEOUT_MS` (default 30000) and
+  `TRACELAKE_TENANT_CONCURRENCY` (default 16). The cap is per process and per
+  tenant name. A request over the cap gets 429. A request past the timeout gets
+  504. The timeout wraps the database call; the permit is released when the call
+  returns, times out, or is cancelled.
 - The server writes the hot store and segments under `TRACELAKE_DATA_DIR`.
   Back up that directory or, on object storage, the bucket prefix.
 - One server process owns a data directory. Two processes against one directory

@@ -12,6 +12,7 @@ use tracelake_query::{AggregateRequest, AggregateResult, QueryError, RecordQuery
 
 use crate::AppState;
 use crate::ingest_handler::ErrorBody;
+use crate::query_handler::limit_response;
 
 type ApiResult<T> = Result<(StatusCode, Json<T>), (StatusCode, Json<ErrorBody>)>;
 
@@ -126,9 +127,15 @@ pub async fn get_record(
     tracelake_core::validate_path_segment("record_id", &record_id)
         .map_err(|error| bad_request(error.to_string()))?;
     let record = state
-        .reader
-        .get_record(&tenant_id, &namespace, &table, &record_id)
+        .limits
+        .run(
+            &tenant_id,
+            state
+                .reader
+                .get_record(&tenant_id, &namespace, &table, &record_id),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(query_error)?;
 
     match record {
@@ -163,9 +170,15 @@ pub async fn post_record_query(
 ) -> ApiResult<RecordListBody> {
     validate_location(&tenant_id, &namespace, &table)?;
     let result = state
-        .reader
-        .query_records(&tenant_id, &namespace, &table, &query)
+        .limits
+        .run(
+            &tenant_id,
+            state
+                .reader
+                .query_records(&tenant_id, &namespace, &table, &query),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(query_error)?;
 
     Ok((
@@ -190,9 +203,15 @@ pub async fn post_record_aggregate(
 ) -> ApiResult<AggregateResult> {
     validate_location(&tenant_id, &namespace, &table)?;
     let result = state
-        .reader
-        .aggregate_records(&tenant_id, &namespace, &table, &request)
+        .limits
+        .run(
+            &tenant_id,
+            state
+                .reader
+                .aggregate_records(&tenant_id, &namespace, &table, &request),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(query_error)?;
 
     Ok((StatusCode::OK, Json(result)))

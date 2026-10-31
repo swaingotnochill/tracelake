@@ -7,6 +7,8 @@ use serde::Deserialize;
 use tracelake_core::Trace;
 use tracelake_query::{AggregateRequest, AggregateResult, QueryError, TraceSearch, TraceSummary};
 
+use crate::limits::LimitError;
+
 use crate::AppState;
 use crate::ingest_handler::ErrorBody;
 
@@ -25,9 +27,13 @@ pub async fn get_trace(
     Path((tenant_id, namespace, trace_id)): Path<(String, String, String)>,
 ) -> Result<(StatusCode, Json<Trace>), (StatusCode, Json<ErrorBody>)> {
     let trace = state
-        .reader
-        .get_trace(&tenant_id, &namespace, &trace_id)
+        .limits
+        .run(
+            &tenant_id,
+            state.reader.get_trace(&tenant_id, &namespace, &trace_id),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(|error| query_error_response(&error))?;
 
     match trace {
@@ -47,9 +53,15 @@ pub async fn post_search(
     Json(body): Json<SearchBody>,
 ) -> Result<(StatusCode, Json<Vec<TraceSummary>>), (StatusCode, Json<ErrorBody>)> {
     let summaries = state
-        .reader
-        .search_traces(&body.tenant_id, &body.namespace, &body.search)
+        .limits
+        .run(
+            &body.tenant_id,
+            state
+                .reader
+                .search_traces(&body.tenant_id, &body.namespace, &body.search),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(|error| query_error_response(&error))?;
 
     Ok((StatusCode::OK, Json(summaries)))
@@ -70,12 +82,36 @@ pub async fn post_span_aggregate(
     Json(body): Json<SpanAggregateBody>,
 ) -> Result<(StatusCode, Json<AggregateResult>), (StatusCode, Json<ErrorBody>)> {
     let result = state
-        .reader
-        .aggregate_spans(&body.tenant_id, &body.namespace, &body.request)
+        .limits
+        .run(
+            &body.tenant_id,
+            state
+                .reader
+                .aggregate_spans(&body.tenant_id, &body.namespace, &body.request),
+        )
         .await
+        .map_err(limit_response)?
         .map_err(|error| query_error_response(&error))?;
 
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Maps a rejected request: too many in flight, or the timeout elapsed.
+pub(crate) fn limit_response(error: LimitError) -> (StatusCode, Json<ErrorBody>) {
+    match error {
+        LimitError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorBody {
+                error: "query timed out".to_string(),
+            }),
+        ),
+        LimitError::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorBody {
+                error: "too many concurrent queries for tenant".to_string(),
+            }),
+        ),
+    }
 }
 
 /// Maps query failures to status codes: invalid arguments are client

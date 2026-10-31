@@ -23,7 +23,7 @@ multi-region replication.
 | Medium | Request bodies had no size limit, so one request could exhaust memory. | Fixed |
 | Medium | 500 responses returned internal error text, including object store paths. | Fixed |
 | Medium | No authentication. | Accepted for alpha, loopback bind |
-| Medium | No rate limiting or query timeouts. A broad search reads every matching pack, and text search over the hot store builds an index per query. | Accepted for alpha |
+| Medium | Read requests had no timeout or per-tenant cap, so one client could occupy a worker indefinitely. | Fixed: 30 s timeout, 16 concurrent reads per tenant, 429 and 504 responses |
 | Medium | No delete, tombstone, or retention path. GDPR deletion is not supported. | Open, alpha blocker for regulated data |
 | Low | Field names reached Parquet column names and aggregation SQL. | Fixed by restricting the character set |
 | Low | Dependencies are not audited in CI. `cargo-audit` and `cargo-deny` are not installed here. | Open, add to CI |
@@ -79,7 +79,8 @@ knows that tenant's name, which is the same trust model as the rest of the alpha
 ## Post-alpha work
 
 - Authentication and per-tenant authorization.
-- Rate limits, query timeouts, and a per-tenant concurrency cap.
+- Request-rate limits. Timeouts and a per-tenant concurrency cap exist; a
+  request-rate limit does not.
 - Delete and retention with tombstones that survive compaction.
 - A dependency audit job (`cargo deny check advisories licenses`).
 - Encryption at rest is delegated to the object store, and should be stated in
