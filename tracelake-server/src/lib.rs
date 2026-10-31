@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
 
         let (status, body) = call(
-            app,
+            app.clone(),
             "POST",
             "/v1/tables/tenantid-1/default/findings/aggregate",
             Some(json!({ "metrics": ["count"] })),
@@ -912,7 +912,14 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_are_visible_in_every_read_path_after_compaction() {
-        let app = build_router(test_state().await);
+        use tracelake_compact::{
+            RecordPackReader, TracePackWriter, read_manifest, read_record_manifest,
+        };
+        use tracelake_core::SegmentFileKind;
+
+        let state = test_state().await;
+        let store = Arc::clone(&state.store);
+        let app = build_router(state);
 
         let mut gone = example_span("trace-gone", "span-a", 1);
         gone.status = SpanStatus::Error;
@@ -964,6 +971,27 @@ mod tests {
         let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
         assert_eq!(status, StatusCode::OK);
 
+        let before = read_manifest(&store, BASE_PATH, "tenantid-1", "default")
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        let before_trace_bytes: u64 = before.segments[0]
+            .files
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum();
+        let before_trace_id = before.segments[0].segment_id.clone();
+        let before_records =
+            read_record_manifest(&store, BASE_PATH, "tenantid-1", "default", "findings")
+                .await
+                .expect("record manifest reads")
+                .expect("record manifest exists");
+        let before_record_bytes: u64 = before_records.segments[0]
+            .files
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum();
+
         let (status, _) = call(
             app.clone(),
             "DELETE",
@@ -981,10 +1009,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // A second compaction persists the tombstones in the manifests.
+        // A second compaction persists the tombstones and rewrites the
+        // segments without the deleted rows.
         let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["segments"], json!([]));
+
+        let after = read_manifest(&store, BASE_PATH, "tenantid-1", "default")
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        assert_eq!(after.segments.len(), 1, "one rewritten segment");
+        assert_ne!(after.segments[0].segment_id, before_trace_id);
+        let after_trace_bytes: u64 = after.segments[0]
+            .files
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum();
+        assert!(
+            after_trace_bytes < before_trace_bytes,
+            "trace segment shrank from {before_trace_bytes} to {after_trace_bytes}"
+        );
+
+        let after_records =
+            read_record_manifest(&store, BASE_PATH, "tenantid-1", "default", "findings")
+                .await
+                .expect("record manifest reads")
+                .expect("record manifest exists");
+        let after_record_bytes: u64 = after_records.segments[0]
+            .files
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum();
+        assert!(
+            after_record_bytes < before_record_bytes,
+            "record segment shrank from {before_record_bytes} to {after_record_bytes}"
+        );
+
+        let trace_pack = after.segments[0]
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::TracePack)
+            .expect("trace pack exists");
+        assert!(
+            TracePackWriter::new(Arc::clone(&store))
+                .read_trace(&trace_pack.path, "trace-gone")
+                .await
+                .expect("pack reads")
+                .is_none(),
+            "the rewritten pack no longer holds the deleted trace"
+        );
+
+        let schema =
+            tracelake_compact::read_schema(&store, BASE_PATH, "tenantid-1", "default", "findings")
+                .await
+                .expect("schema reads")
+                .expect("schema exists");
+        let fields: Vec<&str> = schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        let record_pack = after_records.segments[0]
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::RecordPack)
+            .expect("record pack exists");
+        let packed = RecordPackReader::new(Arc::clone(&store))
+            .read_pack(&record_pack.path, &schema, &fields)
+            .await
+            .expect("record pack reads");
+        assert!(
+            packed
+                .iter()
+                .all(|record| record.get("finding_id") != Some(&json!("f-gone"))),
+            "the rewritten record pack no longer holds the deleted record"
+        );
 
         let (status, _) = call(
             app.clone(),
@@ -1068,7 +1168,7 @@ mod tests {
         assert_eq!(body["rows"][0]["count"], 1);
 
         let (status, body) = call(
-            app,
+            app.clone(),
             "POST",
             "/v1/tables/tenantid-1/default/findings/aggregate",
             Some(json!({ "metrics": ["count"] })),
@@ -1076,6 +1176,66 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["rows"][0]["count"], 1);
+
+        // Delete the survivors. The rewritten segments become empty and are
+        // removed, and their files are deleted.
+        let (status, _) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/traces/tenantid-1/default/trace-keep",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/tables/tenantid-1/default/findings/records/f-keep",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let empty = read_manifest(&store, BASE_PATH, "tenantid-1", "default")
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        assert!(empty.segments.is_empty(), "the emptied segment is removed");
+        assert!(
+            store
+                .head(&slatedb::object_store::path::Path::from(
+                    trace_pack.path.as_str()
+                ))
+                .await
+                .is_err(),
+            "the old pack object is deleted"
+        );
+
+        let empty_records =
+            read_record_manifest(&store, BASE_PATH, "tenantid-1", "default", "findings")
+                .await
+                .expect("record manifest reads")
+                .expect("record manifest exists");
+        assert!(empty_records.segments.is_empty());
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/spans/aggregate",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "metrics": ["count"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["rows"].as_array().is_none_or(|rows| rows.is_empty()),
+            "no rows remain: {body}"
+        );
     }
 
     #[tokio::test]

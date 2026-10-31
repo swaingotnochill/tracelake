@@ -44,15 +44,13 @@ is explicitly out of scope.
 | One tenant cannot starve others | Yes | 16 concurrent reads per tenant, 429 above it |
 | Compaction does not duplicate records | Yes | Watermark plus hot-key deletion; repeat-compaction test |
 | Deletes and retention exist | Yes | Tombstones mask compacted copies; delete and retention tests |
+| Deleted bytes are reclaimed | Yes | Compaction rewrites affected segments, drops deleted rows, removes empty segments, and deletes old files; the test asserts smaller files and an absent trace in the new pack |
 | Authentication exists | No | Loopback bind only |
 | Request-rate limiting exists | No | Concurrency and timeouts exist, a per-second rate cap does not |
 
 ## Required before the alpha tag
 
-1. Segment rewrite so deleted rows stop consuming space. Deletes are logically
-   correct today; tombstones accumulate in the manifest and old segments keep
-   the deleted bytes.
-2. A live S3 or GCS run in CI or a staging environment. The store selection is
+1. A live S3 or GCS run in CI or a staging environment. The store selection is
    tested and the code paths compile, but no bucket credentials are available
    here.
 
@@ -83,9 +81,10 @@ is explicitly out of scope.
   late data readable while hot data is retained, and is a limitation once hot
   retention exists.
 - Deletes write a tombstone under `v1/d/`, remove the hot copy, and mask
-  compacted copies. Compaction folds tombstones into the manifest. Retention
-  deletes traces whose latest span starts before the cutoff; it does not rewrite
-  old segments, so deleted bytes stay on disk until a segment rewrite lands.
+  compacted copies. Compaction folds tombstones into the manifest, rewrites any
+  segment whose bloom names a tombstoned id, drops the deleted rows, removes a
+  segment that becomes empty, and deletes the old files. Retention deletes
+  traces whose latest span starts before the cutoff.
 - Bind to loopback or a private network. There is no authentication.
 
 ## Out of scope for alpha

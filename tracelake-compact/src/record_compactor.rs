@@ -198,6 +198,7 @@ impl RecordCompactor {
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
 
         db.delete_keys(&tombstone_keys(tombstones)).await?;
+        self.rewrite_segments(tenant_id, namespace, table).await?;
         Ok(())
     }
 
@@ -230,53 +231,9 @@ impl RecordCompactor {
         });
 
         let segment_id = tracelake_core::segment_id(manifest.next_segment_number());
-        let pack_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::RecordPack,
-                encode_record_pack(&schema, &group.records)?,
-            )
+        let entry = self
+            .write_segment_files(group, &schema, &segment_id)
             .await?;
-        let bloom_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Bloom,
-                build_record_bloom(&schema, &group.records)?,
-            )
-            .await?;
-
-        let record_stats = build_record_stats(&schema, &group.records)?;
-        let stats_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Stats,
-                serde_json::to_vec(&record_stats)?,
-            )
-            .await?;
-
-        let columns_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Columns,
-                crate::column_writer::encode_parquet(&crate::column_writer::build_record_batch(
-                    &schema,
-                    &group.records,
-                )?)?,
-            )
-            .await?;
-
-        let entry = SegmentEntry {
-            segment_id: segment_id.clone(),
-            trace_count: 0,
-            span_count: 0,
-            files: vec![pack_file, bloom_file, stats_file, columns_file],
-            stats: tracelake_core::SegmentStats::default(),
-            record_stats: Some(record_stats),
-        };
 
         manifest.segments.push(entry.clone());
         manifest.watermark = Some(watermark.to_string());
@@ -304,7 +261,213 @@ impl RecordCompactor {
         db.delete_keys(&keys).await?;
         db.delete_keys(&tombstone_keys(tombstones)).await?;
 
+        self.rewrite_segments(&group.tenant_id, &group.namespace, &group.table)
+            .await?;
+
         Ok(entry)
+    }
+
+    /// Writes every file of one record segment and returns its manifest entry.
+    async fn write_segment_files(
+        &self,
+        group: &RecordGroup,
+        schema: &TableSchema,
+        segment_id: &str,
+    ) -> Result<SegmentEntry, CompactError> {
+        let pack_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::RecordPack,
+                encode_record_pack(schema, &group.records)?,
+            )
+            .await?;
+        let bloom_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Bloom,
+                build_record_bloom(schema, &group.records)?,
+            )
+            .await?;
+
+        let record_stats = build_record_stats(schema, &group.records)?;
+        let stats_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Stats,
+                serde_json::to_vec(&record_stats)?,
+            )
+            .await?;
+
+        let columns_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Columns,
+                crate::column_writer::encode_parquet(&crate::column_writer::build_record_batch(
+                    schema,
+                    &group.records,
+                )?)?,
+            )
+            .await?;
+
+        Ok(SegmentEntry {
+            segment_id: segment_id.to_string(),
+            trace_count: 0,
+            span_count: 0,
+            files: vec![pack_file, bloom_file, stats_file, columns_file],
+            stats: tracelake_core::SegmentStats::default(),
+            record_stats: Some(record_stats),
+        })
+    }
+
+    /// Rewrites segments that still hold tombstoned records, then deletes the
+    /// old files. An empty replacement removes the segment.
+    async fn rewrite_segments(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(), CompactError> {
+        let Some(mut manifest) =
+            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?
+        else {
+            return Ok(());
+        };
+        if manifest.deleted.is_empty() {
+            return Ok(());
+        }
+
+        let Some(schema) =
+            read_schema(&self.store, &self.base_path, tenant_id, namespace, table).await?
+        else {
+            return Ok(());
+        };
+        let deleted: HashSet<String> = manifest
+            .deleted
+            .iter()
+            .map(|tombstone| tombstone.id.clone())
+            .collect();
+
+        let mut next_segment = manifest.next_segment_number();
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        let mut removed_files = Vec::new();
+        let mut changed = false;
+
+        for entry in &manifest.segments {
+            if !self.segment_may_hold(entry, &deleted).await? {
+                segments.push(entry.clone());
+                continue;
+            }
+
+            let records = self.read_pack_records(entry, &schema).await?;
+            let mut kept = Vec::new();
+            for record in records {
+                let record_id = schema.record_id(&record)?;
+                if !deleted.contains(&record_id) {
+                    kept.push(record);
+                }
+            }
+
+            if kept.is_empty() {
+                removed_files.extend(entry.files.iter().map(|file| file.path.clone()));
+                changed = true;
+                continue;
+            }
+
+            let segment_id = tracelake_core::segment_id(next_segment);
+            next_segment += 1;
+            let group = RecordGroup {
+                tenant_id: tenant_id.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                schema: schema.clone(),
+                records: kept,
+            };
+            let replacement = self
+                .write_segment_files(&group, &schema, &segment_id)
+                .await?;
+            removed_files.extend(entry.files.iter().map(|file| file.path.clone()));
+            segments.push(replacement);
+            changed = true;
+        }
+
+        if !changed {
+            return Ok(());
+        }
+
+        manifest.segments = segments;
+        publish_manifest(&self.store, &self.base_path, &manifest).await?;
+        self.delete_files(&removed_files).await?;
+
+        Ok(())
+    }
+
+    async fn segment_may_hold(
+        &self,
+        entry: &SegmentEntry,
+        deleted: &HashSet<String>,
+    ) -> Result<bool, CompactError> {
+        let Some(bloom_file) = entry
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::Bloom)
+        else {
+            return Ok(true);
+        };
+
+        let bytes = self
+            .store
+            .get(&Path::from(bloom_file.path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let bloom = tracelake_core::BloomFilter::decode(&bytes)?;
+
+        Ok(deleted
+            .iter()
+            .any(|record_id| bloom.contains(record_id.as_bytes())))
+    }
+
+    async fn read_pack_records(
+        &self,
+        entry: &SegmentEntry,
+        schema: &TableSchema,
+    ) -> Result<Vec<Record>, CompactError> {
+        let pack_file = entry
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::RecordPack)
+            .ok_or_else(|| CompactError::MissingRecordPack {
+                segment_id: entry.segment_id.clone(),
+            })?;
+        let bytes = self
+            .store
+            .get(&Path::from(pack_file.path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let fields: Vec<&str> = schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+
+        Ok(tracelake_core::decode_record_pack(&bytes)?.scan(schema, &fields)?)
+    }
+
+    async fn delete_files(&self, paths: &[String]) -> Result<(), CompactError> {
+        for path in paths {
+            match self.store.delete(&Path::from(path.as_str())).await {
+                Ok(()) => {}
+                Err(slatedb::object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(())
     }
 
     async fn put_file(

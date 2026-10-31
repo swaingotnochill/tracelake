@@ -1,0 +1,13 @@
+[advisories]
+# Transitive advisories with no semver-compatible fix in the current graph.
+# Each entry names the crate that must move before the ignore can be removed.
+ignore = [
+    # patched in zstd >=0.14.3; pinned by parquet 60, datafusion 55, and foyer
+    "RUSTSEC-2026-0391",
+    # patched in zstd-safe >=8.2.0; follows zstd 0.14
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0398",
+    # patched in quick-xml >=0.41.0; pinned by object_store's AWS feature
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+]

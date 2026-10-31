@@ -24,7 +24,7 @@ multi-region replication.
 | Medium | 500 responses returned internal error text, including object store paths. | Fixed |
 | Medium | No authentication. | Accepted for alpha, loopback bind |
 | Medium | Read requests had no timeout or per-tenant cap, so one client could occupy a worker indefinitely. | Fixed: 30 s timeout, 16 concurrent reads per tenant, 429 and 504 responses |
-| Low | Dependencies were not audited. | Fixed: `audit` workflow runs RustSec on lockfile changes and weekly |
+| High | A local `cargo audit` found 17 vulnerabilities in transitive dependencies, mostly in the TLS stack and the zstd bindings. | 12 fixed by `cargo update`; 5 remain and are recorded as explicit exceptions |
 | Medium | No delete, tombstone, or retention path. GDPR deletion is not supported. | Open, alpha blocker for regulated data |
 | Low | Field names reached Parquet column names and aggregation SQL. | Fixed by restricting the character set |
 
@@ -59,7 +59,26 @@ aggregation SQL.
   trace search, schema lookup, and record query across tenants.
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.
 - `.github/workflows/audit.yml` runs RustSec on lockfile changes and weekly.
+- `.cargo/audit.toml` records every ignored advisory with the version that fixes
+  it and the crate that must move first.
 - `grep -rn unsafe --include='*.rs' tracelake-*` returns no code use of unsafe.
+
+## Dependency audit
+
+`cargo audit` at this commit found 17 vulnerabilities. `cargo update` moved 12 of
+them to patched versions. Five remain because they need a version that no
+dependency in the current graph accepts.
+
+| Advisory | Crate | Fixed in | Pinned by | Exposure |
+|----------|-------|----------|-----------|----------|
+| RUSTSEC-2026-0391 | zstd 0.13.3 | 0.14.3 | parquet 60, datafusion 55, foyer | Compression inside storage and analytics. TraceLake never calls zstd directly. |
+| RUSTSEC-2026-0403, RUSTSEC-2026-0398 | zstd-safe 7.3.0 | 8.2.0 | follows zstd | Decompression of stored blocks. |
+| RUSTSEC-2026-0195, RUSTSEC-2026-0194 | quick-xml 0.38.4 | 0.41.0 | object_store AWS feature | Parsing S3 responses from the configured endpoint. Not on the local-store path. |
+
+These are ignored in `.cargo/audit.toml` so the CI job still fails on any new
+advisory. Remove an ignore when its dependency graph allows the fixed version.
+Sixteen unmaintained or unsound warnings remain in transitive crates; the audit
+job reports them without failing.
 
 ## Isolation model
 

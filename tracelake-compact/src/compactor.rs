@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tracelake_core::{
-    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Tombstone, TombstoneKey,
-    Trace, decode_tombstone_key, encode_span_storage_key, encode_trace_pack,
+    BloomFilter, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Tombstone,
+    TombstoneKey, Trace, decode_tombstone_key, decode_trace_pack, encode_span_storage_key,
+    encode_trace_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -40,6 +41,9 @@ pub enum CompactError {
 
     #[error("column file failed: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
+
+    #[error("bloom filter failed: {0}")]
+    Bloom(#[from] tracelake_core::BloomError),
 
     #[error("parquet failed: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -286,6 +290,7 @@ impl Compactor {
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
 
         db.delete_keys(&tombstone_keys(tombstones)).await?;
+        self.rewrite_segments(tenant_id, namespace_name).await?;
         Ok(())
     }
 
@@ -306,68 +311,7 @@ impl Compactor {
         .unwrap_or_else(|| SegmentManifest::new(&group.tenant_id, &group.namespace));
 
         let segment_id = tracelake_core::segment_id(manifest.next_segment_number());
-
-        let pack_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::TracePack,
-                encode_trace_pack(&group.traces)?,
-            )
-            .await?;
-
-        let bloom_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Bloom,
-                build_segment_bloom(group),
-            )
-            .await?;
-
-        let text_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Text,
-                crate::text_indexer::build_text_index(&group.traces)?,
-            )
-            .await?;
-
-        let spans: Vec<tracelake_core::Span> = group
-            .traces
-            .iter()
-            .flat_map(|trace| trace.spans.iter().cloned())
-            .collect();
-        let columns_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Columns,
-                crate::column_writer::encode_parquet(&crate::column_writer::build_span_batch(
-                    &spans,
-                )?)?,
-            )
-            .await?;
-
-        let stats = build_segment_stats(group);
-        let stats_file = self
-            .put_file(
-                group,
-                &segment_id,
-                SegmentFileKind::Stats,
-                serde_json::to_vec(&stats)?,
-            )
-            .await?;
-
-        let entry = SegmentEntry {
-            segment_id: segment_id.clone(),
-            trace_count: stats.trace_count,
-            span_count: stats.span_count,
-            files: vec![pack_file, bloom_file, stats_file, text_file, columns_file],
-            stats,
-            record_stats: None,
-        };
+        let entry = self.write_segment_files(group, &segment_id).await?;
 
         manifest.segments.push(entry.clone());
         manifest.watermark = watermark.map(str::to_string);
@@ -383,7 +327,218 @@ impl Compactor {
         db.delete_keys(&keys).await?;
         db.delete_keys(&tombstone_keys(tombstones)).await?;
 
+        self.rewrite_segments(&group.tenant_id, &group.namespace)
+            .await?;
+
         Ok(entry)
+    }
+
+    /// Writes every file of one segment and returns its manifest entry.
+    async fn write_segment_files(
+        &self,
+        group: &TraceGroup,
+        segment_id: &str,
+    ) -> Result<SegmentEntry, CompactError> {
+        let pack_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::TracePack,
+                encode_trace_pack(&group.traces)?,
+            )
+            .await?;
+
+        let bloom_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Bloom,
+                build_segment_bloom(group),
+            )
+            .await?;
+
+        let text_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Text,
+                crate::text_indexer::build_text_index(&group.traces)?,
+            )
+            .await?;
+
+        let spans: Vec<Span> = group
+            .traces
+            .iter()
+            .flat_map(|trace| trace.spans.iter().cloned())
+            .collect();
+        let columns_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Columns,
+                crate::column_writer::encode_parquet(&crate::column_writer::build_span_batch(
+                    &spans,
+                )?)?,
+            )
+            .await?;
+
+        let stats = build_segment_stats(group);
+        let stats_file = self
+            .put_file(
+                group,
+                segment_id,
+                SegmentFileKind::Stats,
+                serde_json::to_vec(&stats)?,
+            )
+            .await?;
+
+        Ok(SegmentEntry {
+            segment_id: segment_id.to_string(),
+            trace_count: stats.trace_count,
+            span_count: stats.span_count,
+            files: vec![pack_file, bloom_file, stats_file, text_file, columns_file],
+            stats,
+            record_stats: None,
+        })
+    }
+
+    /// Rewrites segments that still hold tombstoned traces, then deletes the
+    /// old files. A segment that becomes empty is removed from the manifest.
+    async fn rewrite_segments(&self, tenant_id: &str, namespace: &str) -> Result<(), CompactError> {
+        let Some(mut manifest) =
+            read_manifest(&self.store, &self.base_path, tenant_id, namespace).await?
+        else {
+            return Ok(());
+        };
+        if manifest.deleted.is_empty() {
+            return Ok(());
+        }
+
+        let deleted: HashSet<String> = manifest
+            .deleted
+            .iter()
+            .map(|tombstone| tombstone.id.clone())
+            .collect();
+        let mut next_segment = manifest.next_segment_number();
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        let mut removed_files = Vec::new();
+        let mut changed = false;
+
+        for entry in &manifest.segments {
+            if !self.segment_may_hold(entry, &deleted).await? {
+                segments.push(entry.clone());
+                continue;
+            }
+
+            let traces = self.read_pack_traces(entry, tenant_id, namespace).await?;
+            let kept: Vec<Trace> = traces
+                .into_iter()
+                .filter(|trace| !deleted.contains(&trace.trace_id))
+                .collect();
+
+            if kept.is_empty() {
+                removed_files.extend(entry.files.iter().map(|file| file.path.clone()));
+                changed = true;
+                continue;
+            }
+
+            let segment_id = tracelake_core::segment_id(next_segment);
+            next_segment += 1;
+            let group = TraceGroup {
+                tenant_id: tenant_id.to_string(),
+                namespace: namespace.to_string(),
+                traces: kept,
+            };
+            let replacement = self.write_segment_files(&group, &segment_id).await?;
+            removed_files.extend(entry.files.iter().map(|file| file.path.clone()));
+            segments.push(replacement);
+            changed = true;
+        }
+
+        if !changed {
+            return Ok(());
+        }
+
+        manifest.segments = segments;
+        publish_manifest(&self.store, &self.base_path, &manifest).await?;
+        self.delete_files(&removed_files).await?;
+
+        Ok(())
+    }
+
+    /// Whether a segment's bloom filter names any tombstoned trace. A segment
+    /// without a bloom file is always rewritten.
+    async fn segment_may_hold(
+        &self,
+        entry: &SegmentEntry,
+        deleted: &HashSet<String>,
+    ) -> Result<bool, CompactError> {
+        let Some(bloom_file) = entry
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::Bloom)
+        else {
+            return Ok(true);
+        };
+
+        let bytes = self
+            .store
+            .get(&Path::from(bloom_file.path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let bloom = BloomFilter::decode(&bytes)?;
+
+        Ok(deleted
+            .iter()
+            .any(|trace_id| bloom.contains(trace_id.as_bytes())))
+    }
+
+    async fn read_pack_traces(
+        &self,
+        entry: &SegmentEntry,
+        tenant_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<Trace>, CompactError> {
+        let pack_file = entry
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::TracePack)
+            .ok_or_else(|| CompactError::MissingRecordPack {
+                segment_id: entry.segment_id.clone(),
+            })?;
+        let bytes = self
+            .store
+            .get(&Path::from(pack_file.path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let pack = decode_trace_pack(&bytes)?;
+
+        pack.trace_ids()?
+            .into_iter()
+            .map(|trace_id| {
+                let spans = pack.read_trace(&trace_id)?.unwrap_or_default();
+                Ok(Trace {
+                    tenant_id: tenant_id.to_string(),
+                    namespace: namespace.to_string(),
+                    trace_id,
+                    spans,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_files(&self, paths: &[String]) -> Result<(), CompactError> {
+        for path in paths {
+            match self.store.delete(&Path::from(path.as_str())).await {
+                Ok(()) => {}
+                Err(slatedb::object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes one segment file and returns its manifest record.
