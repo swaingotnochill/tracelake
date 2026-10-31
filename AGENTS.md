@@ -535,7 +535,7 @@ Every PR must pass:
 1. `cargo fmt --check`
 2. `cargo clippy -- -D warnings`
 3. `cargo nextest run` (all tests)
-4. `cargo deny check` (license audit)
+4. `cargo audit` (RustSec advisories; the `audit` workflow runs it)
 
 ### 9.6 How to Profile Each Build Step
 

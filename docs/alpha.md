@@ -21,6 +21,7 @@ is explicitly out of scope.
 | Delete a trace or record | `DELETE /v1/traces/...`, `DELETE .../records/{id}` | delete e2e test |
 | Retention | `POST /v1/retention` with a cutoff | retention test |
 | Read limits | timeout and per-tenant cap | limiter unit tests, 429 e2e test |
+| Dependency advisories | `audit` CI workflow | `.github/workflows/audit.yml` |
 | Select an object store | `TRACELAKE_STORE=local`, `s3`, or `gcs` | `store.rs` tests |
 | Durable storage | `TRACELAKE_DATA_DIR`, or an S3 or GCS bucket | restart test, store selection tests |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
@@ -36,6 +37,7 @@ is explicitly out of scope.
 | Schemas can change without rewriting history | Yes | Pack field descriptors and defaults |
 | Tenant isolation at the key and path level | Yes | Isolation tests |
 | A single process can restart without data loss | Yes | Restart test |
+| Dependency advisories are checked in CI | Yes | `audit` workflow on changes and weekly |
 | Object storage is selectable at runtime | Yes | `store.rs` selection and configuration tests. S3 and GCS are compile-tested and configuration-tested; no live bucket was exercised here |
 | Request size is bounded | Yes | 32 MiB body limit |
 | A read cannot run forever | Yes | 30 s query timeout, 504 on expiry |
@@ -43,15 +45,14 @@ is explicitly out of scope.
 | Compaction does not duplicate records | Yes | Watermark plus hot-key deletion; repeat-compaction test |
 | Deletes and retention exist | Yes | Tombstones mask compacted copies; delete and retention tests |
 | Authentication exists | No | Loopback bind only |
-| Query timeouts and limits exist | No | Broad queries can run long |
+| Request-rate limiting exists | No | Concurrency and timeouts exist, a per-second rate cap does not |
 
 ## Required before the alpha tag
 
-1. A dependency audit job in CI.
-2. Segment rewrite so deleted rows stop consuming space. Deletes are logically
+1. Segment rewrite so deleted rows stop consuming space. Deletes are logically
    correct today; tombstones accumulate in the manifest and old segments keep
    the deleted bytes.
-3. A live S3 or GCS run in CI or a staging environment. The store selection is
+2. A live S3 or GCS run in CI or a staging environment. The store selection is
    tested and the code paths compile, but no bucket credentials are available
    here.
 
@@ -69,8 +70,8 @@ is explicitly out of scope.
   Credentials come from the provider chain (`AWS_*` or `GOOGLE_*`); the server
   never reads keys from its own settings.
 - For a local store, the server writes the hot store and segments under
-  `TRACELAKE_DATA_DIR`.
-  Back up that directory or, on object storage, the bucket prefix.
+  `TRACELAKE_DATA_DIR`. Back up that directory, or the bucket prefix on object
+  storage.
 - One server process owns a data directory. Two processes against one directory
   are untested.
 - Compaction is triggered by `POST /v1/compact`; there is no background scheduler
