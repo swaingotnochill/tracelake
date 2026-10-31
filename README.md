@@ -239,7 +239,8 @@ API, custom table schemas with evolution, inspect-ai eval storage, and the
 benchmark suite. Alpha readiness, security posture, and gaps against SmithDB and
 Brainstore are recorded in [docs/alpha.md](docs/alpha.md),
 [docs/security.md](docs/security.md), and
-[docs/research/gap-analysis.md](docs/research/gap-analysis.md).
+[docs/research/gap-analysis.md](docs/research/gap-analysis.md). Measured
+latency and the range-read fix are in [docs/performance.md](docs/performance.md).
 
 ## License
 

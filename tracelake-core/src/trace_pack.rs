@@ -5,11 +5,14 @@ use thiserror::Error;
 
 /// Format marker at the start of every trace pack. The trailing digits are the
 /// format version; bump them when the layout changes incompatibly.
-const MAGIC: [u8; 8] = *b"TRCPAK01";
+const MAGIC: [u8; 8] = *b"TRCPAK02";
 
 /// Header length: magic (8) + trace_count (4) + span_count (8) + directory
 /// offset (8), all little-endian.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
+
+/// Header length, exported so a range reader can fetch exactly the header.
+pub const TRACE_PACK_HEADER_LEN: usize = HEADER_LEN;
 
 /// Footer length: crc32 (4) over every byte before the footer.
 const FOOTER_LEN: usize = 4;
@@ -51,6 +54,9 @@ pub enum TracePackError {
     #[error("trace block has {extra} trailing bytes")]
     TrailingBytes { extra: usize },
 
+    #[error("trace block checksum mismatch: expected {expected:#x}, found {found:#x}")]
+    BlockChecksumMismatch { expected: u32, found: u32 },
+
     #[error("span decode failed: {0}")]
     SpanDecode(#[from] serde_json::Error),
 }
@@ -80,7 +86,7 @@ pub fn encode_trace_pack(traces: &[Trace]) -> Result<Vec<u8>, TracePackError> {
     }
 
     let mut blocks: Vec<u8> = Vec::new();
-    let mut entries: Vec<(String, u32, u64, u64)> = Vec::with_capacity(sorted.len());
+    let mut entries: Vec<(String, u32, u64, u64, u32)> = Vec::with_capacity(sorted.len());
     let mut span_count: u64 = 0;
 
     for trace in &sorted {
@@ -97,11 +103,13 @@ pub fn encode_trace_pack(traces: &[Trace]) -> Result<Vec<u8>, TracePackError> {
             blocks.extend_from_slice(&value);
         }
 
+        let block_len = blocks.len() - block_start;
         entries.push((
             trace.trace_id.clone(),
             trace.spans.len() as u32,
             (HEADER_LEN + block_start) as u64,
-            (blocks.len() - block_start) as u64,
+            block_len as u64,
+            checksum(&blocks[block_start..]),
         ));
         span_count += trace.spans.len() as u64;
     }
@@ -112,7 +120,7 @@ pub fn encode_trace_pack(traces: &[Trace]) -> Result<Vec<u8>, TracePackError> {
     let mut entry_bytes: Vec<u8> = Vec::new();
     let mut entry_offsets: Vec<u64> = Vec::with_capacity(entries.len());
 
-    for (trace_id, span_count, block_offset, block_len) in &entries {
+    for (trace_id, span_count, block_offset, block_len, block_crc32) in &entries {
         let trace_id_len =
             u16::try_from(trace_id.len()).map_err(|_| TracePackError::TraceIdTooLong {
                 len: trace_id.len(),
@@ -123,6 +131,7 @@ pub fn encode_trace_pack(traces: &[Trace]) -> Result<Vec<u8>, TracePackError> {
         entry_bytes.extend_from_slice(&span_count.to_le_bytes());
         entry_bytes.extend_from_slice(&block_offset.to_le_bytes());
         entry_bytes.extend_from_slice(&block_len.to_le_bytes());
+        entry_bytes.extend_from_slice(&block_crc32.to_le_bytes());
     }
 
     let mut pack =
@@ -150,19 +159,48 @@ pub fn encode_trace_pack(traces: &[Trace]) -> Result<Vec<u8>, TracePackError> {
 #[derive(Debug, Clone, Copy)]
 pub struct TracePack<'a> {
     bytes: &'a [u8],
-    trace_count: usize,
-    span_count: u64,
-    entry_offsets_pos: usize,
+    header: TracePackHeader,
+    directory: &'a [u8],
+}
+
+/// Fixed part of a trace pack header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TracePackHeader {
+    pub trace_count: usize,
+    pub span_count: u64,
+    pub directory_offset: usize,
+}
+
+/// One trace's location inside a pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceBlockRef {
+    pub span_count: u32,
+    pub block_offset: u64,
+    pub block_len: u64,
+    pub block_crc32: u32,
+}
+
+/// Decodes the header without reading the rest of the pack. A range reader
+/// fetches these bytes first, then the directory, then one block.
+pub fn decode_trace_pack_header(bytes: &[u8]) -> Result<TracePackHeader, TracePackError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(TracePackError::Truncated { len: bytes.len() });
+    }
+    if bytes[..MAGIC.len()] != MAGIC {
+        return Err(TracePackError::BadMagic);
+    }
+
+    Ok(TracePackHeader {
+        trace_count: read_u32(bytes, MAGIC.len())? as usize,
+        span_count: read_u64(bytes, MAGIC.len() + 4)?,
+        directory_offset: read_u64(bytes, MAGIC.len() + 12)? as usize,
+    })
 }
 
 /// Decodes and validates a trace pack from its bytes.
 pub fn decode_trace_pack(bytes: &[u8]) -> Result<TracePack<'_>, TracePackError> {
     if bytes.len() < HEADER_LEN + FOOTER_LEN {
         return Err(TracePackError::Truncated { len: bytes.len() });
-    }
-
-    if bytes[..MAGIC.len()] != MAGIC {
-        return Err(TracePackError::BadMagic);
     }
 
     let checksum_pos = bytes.len() - FOOTER_LEN;
@@ -172,51 +210,116 @@ pub fn decode_trace_pack(bytes: &[u8]) -> Result<TracePack<'_>, TracePackError> 
         return Err(TracePackError::ChecksumMismatch { expected, found });
     }
 
-    let trace_count = read_u32(bytes, MAGIC.len())? as usize;
-    let span_count = read_u64(bytes, MAGIC.len() + 4)?;
-    let entry_offsets_pos = read_u64(bytes, MAGIC.len() + 12)? as usize;
-
-    let directory_len = 8 * trace_count;
-    let directory_end = entry_offsets_pos.checked_add(directory_len).ok_or(
-        TracePackError::DirectoryOutOfBounds {
-            offset: entry_offsets_pos as u64,
-            count: trace_count as u64,
+    let header = decode_trace_pack_header(bytes)?;
+    let directory_end = header
+        .directory_offset
+        .checked_add(8 * header.trace_count)
+        .ok_or(TracePackError::DirectoryOutOfBounds {
+            offset: header.directory_offset as u64,
+            count: header.trace_count as u64,
             total: bytes.len(),
-        },
-    )?;
+        })?;
     if directory_end > checksum_pos {
         return Err(TracePackError::DirectoryOutOfBounds {
-            offset: entry_offsets_pos as u64,
-            count: trace_count as u64,
+            offset: header.directory_offset as u64,
+            count: header.trace_count as u64,
             total: bytes.len(),
         });
     }
 
     Ok(TracePack {
         bytes,
-        trace_count,
-        span_count,
-        entry_offsets_pos,
+        header,
+        directory: &bytes[header.directory_offset..checksum_pos],
     })
+}
+
+/// Finds one trace in a pack directory. `directory` starts at the pack's
+/// directory offset, which is what a range reader fetches after the header.
+pub fn find_trace_block(
+    directory: &[u8],
+    header: &TracePackHeader,
+    trace_id: &str,
+) -> Result<Option<TraceBlockRef>, TracePackError> {
+    if directory.len() < 8 * header.trace_count {
+        return Err(TracePackError::Truncated {
+            len: directory.len(),
+        });
+    }
+
+    let mut low = 0;
+    let mut high = header.trace_count;
+
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let (entry_id, block) = entry_in_directory(directory, header, mid)?;
+
+        match entry_id.as_bytes().cmp(trace_id.as_bytes()) {
+            Ordering::Equal => return Ok(Some(block)),
+            Ordering::Less => low = mid + 1,
+            Ordering::Greater => high = mid,
+        }
+    }
+
+    Ok(None)
+}
+
+/// Decodes one trace block and verifies its checksum.
+pub fn decode_trace_block(
+    block: &[u8],
+    span_count: u32,
+    block_crc32: u32,
+) -> Result<Vec<Span>, TracePackError> {
+    let found = checksum(block);
+    if found != block_crc32 {
+        return Err(TracePackError::BlockChecksumMismatch {
+            expected: block_crc32,
+            found,
+        });
+    }
+
+    let mut spans = Vec::with_capacity(span_count as usize);
+    let mut pos = 0;
+
+    while pos < block.len() {
+        let span_len = read_u32(block, pos)? as usize;
+        let value_start = pos + 4;
+        let value_end = value_start
+            .checked_add(span_len)
+            .ok_or(TracePackError::Truncated { len: block.len() })?;
+        let value = block
+            .get(value_start..value_end)
+            .ok_or(TracePackError::Truncated { len: block.len() })?;
+        spans.push(serde_json::from_slice(value)?);
+        pos = value_end;
+    }
+
+    if pos != block.len() {
+        return Err(TracePackError::TrailingBytes {
+            extra: block.len() - pos,
+        });
+    }
+
+    Ok(spans)
 }
 
 impl TracePack<'_> {
     /// Number of traces in the pack.
     pub fn trace_count(&self) -> usize {
-        self.trace_count
+        self.header.trace_count
     }
 
     /// Total number of spans across all traces in the pack.
     pub fn span_count(&self) -> u64 {
-        self.span_count
+        self.header.span_count
     }
 
     /// Every trace_id in the pack, sorted.
     pub fn trace_ids(&self) -> Result<Vec<String>, TracePackError> {
-        let mut ids = Vec::with_capacity(self.trace_count);
-        for index in 0..self.trace_count {
-            let entry = self.entry_at(index)?;
-            ids.push(entry.trace_id.to_string());
+        let mut ids = Vec::with_capacity(self.header.trace_count);
+        for index in 0..self.header.trace_count {
+            let (trace_id, _) = entry_in_directory(self.directory, &self.header, index)?;
+            ids.push(trace_id.to_string());
         }
         Ok(ids)
     }
@@ -224,71 +327,55 @@ impl TracePack<'_> {
     /// Returns the spans for one trace, or `None` when the pack does not hold
     /// it. Spans come back in the order they were encoded.
     pub fn read_trace(&self, trace_id: &str) -> Result<Option<Vec<Span>>, TracePackError> {
-        let mut low = 0;
-        let mut high = self.trace_count;
+        let Some(block) = find_trace_block(self.directory, &self.header, trace_id)? else {
+            return Ok(None);
+        };
 
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let entry = self.entry_at(mid)?;
-
-            match entry.trace_id.as_bytes().cmp(trace_id.as_bytes()) {
-                Ordering::Equal => return self.read_block(&entry).map(Some),
-                Ordering::Less => low = mid + 1,
-                Ordering::Greater => high = mid,
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn entry_at(&self, index: usize) -> Result<DirectoryEntry<'_>, TracePackError> {
-        let offset_pos = self.entry_offsets_pos + index * 8;
-        let entry_pos = read_u64(self.bytes, offset_pos)? as usize;
-        read_entry(self.bytes, entry_pos)
-    }
-
-    fn read_block(&self, entry: &DirectoryEntry<'_>) -> Result<Vec<Span>, TracePackError> {
-        let start = entry.block_offset as usize;
-        let end = start.checked_add(entry.block_len as usize).ok_or(
+        let start = block.block_offset as usize;
+        let end = start.checked_add(block.block_len as usize).ok_or(
             TracePackError::BlockOutOfBounds {
-                offset: entry.block_offset,
-                len: entry.block_len,
+                offset: block.block_offset,
+                len: block.block_len,
                 total: self.bytes.len(),
             },
         )?;
-        let block = self
+        let bytes = self
             .bytes
             .get(start..end)
             .ok_or(TracePackError::BlockOutOfBounds {
-                offset: entry.block_offset,
-                len: entry.block_len,
+                offset: block.block_offset,
+                len: block.block_len,
                 total: self.bytes.len(),
             })?;
 
-        let mut spans = Vec::with_capacity(entry.span_count as usize);
-        let mut pos = 0;
-
-        while pos < block.len() {
-            let span_len = read_u32(block, pos)? as usize;
-            let value_start = pos + 4;
-            let value_end = value_start
-                .checked_add(span_len)
-                .ok_or(TracePackError::Truncated { len: block.len() })?;
-            let value = block
-                .get(value_start..value_end)
-                .ok_or(TracePackError::Truncated { len: block.len() })?;
-            spans.push(serde_json::from_slice(value)?);
-            pos = value_end;
-        }
-
-        if pos != block.len() {
-            return Err(TracePackError::TrailingBytes {
-                extra: block.len() - pos,
-            });
-        }
-
-        Ok(spans)
+        decode_trace_block(bytes, block.span_count, block.block_crc32).map(Some)
     }
+}
+
+/// One directory entry, resolved to a pack-relative position.
+fn entry_in_directory<'a>(
+    directory: &'a [u8],
+    header: &TracePackHeader,
+    index: usize,
+) -> Result<(&'a str, TraceBlockRef), TracePackError> {
+    let offset = read_u64(directory, index * 8)? as usize;
+    let position =
+        offset
+            .checked_sub(header.directory_offset)
+            .ok_or(TracePackError::Truncated {
+                len: directory.len(),
+            })?;
+    let entry = read_entry(directory, position)?;
+
+    Ok((
+        entry.trace_id,
+        TraceBlockRef {
+            span_count: entry.span_count,
+            block_offset: entry.block_offset,
+            block_len: entry.block_len,
+            block_crc32: entry.block_crc32,
+        },
+    ))
 }
 
 /// One directory entry: where a trace's block lives.
@@ -298,6 +385,7 @@ struct DirectoryEntry<'a> {
     span_count: u32,
     block_offset: u64,
     block_len: u64,
+    block_crc32: u32,
 }
 
 fn read_entry(bytes: &[u8], pos: usize) -> Result<DirectoryEntry<'_>, TracePackError> {
@@ -316,6 +404,7 @@ fn read_entry(bytes: &[u8], pos: usize) -> Result<DirectoryEntry<'_>, TracePackE
         span_count: read_u32(bytes, id_end)?,
         block_offset: read_u64(bytes, id_end + 4)?,
         block_len: read_u64(bytes, id_end + 12)?,
+        block_crc32: read_u32(bytes, id_end + 20)?,
     })
 }
 
@@ -527,6 +616,23 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupted_block_is_reported_when_the_footer_is_restamped() {
+        let traces = vec![sample_trace("trace-1", &["a", "b"])];
+        let mut bytes = encode_trace_pack(&traces).expect("pack should encode");
+
+        bytes[HEADER_LEN + 5] ^= 0xff;
+        let checksum_pos = bytes.len() - FOOTER_LEN;
+        let checksum = checksum(&bytes[..checksum_pos]);
+        bytes[checksum_pos..].copy_from_slice(&checksum.to_le_bytes());
+
+        let pack = decode_trace_pack(&bytes).expect("restamped footer validates");
+        assert!(matches!(
+            pack.read_trace("trace-1"),
+            Err(TracePackError::BlockChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn corrupted_payload_fails_checksum() {
         let traces = vec![sample_trace("trace-1", &["a", "b", "c", "d"])];
         let mut bytes = encode_trace_pack(&traces).expect("pack should encode");
@@ -579,6 +685,7 @@ mod verify {
         pack.extend_from_slice(&1u32.to_le_bytes());
         pack.extend_from_slice(&(HEADER_LEN as u64).to_le_bytes());
         pack.extend_from_slice(&(block_len as u64).to_le_bytes());
+        pack.extend_from_slice(&checksum(payload).to_le_bytes());
 
         let checksum = checksum(&pack);
         pack.extend_from_slice(&checksum.to_le_bytes());

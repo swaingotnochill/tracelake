@@ -24,7 +24,7 @@ schema.
 |------------|-----------------|---------|------------|
 | Object storage as truth | Yes, through `object_store` | Yes | Yes |
 | Hot write buffer | SlateDB LSM | LSM | Object-store WAL plus memory |
-| Trace-local row store | Trace pack keyed by trace_id | Yes | Row store per segment |
+| Trace-local row store | Trace pack keyed by trace_id, fetched by range | Yes | Row store per segment |
 | Typed record tables | Yes, with schema evolution | Yes, columnar | Semi-structured first |
 | Filter pushdown | Bloom, per-field stats | Segment metadata | Segment metadata |
 | Full-text search | Tantivy per segment, hot fallback | Inverted index | Tantivy inverted index |
@@ -37,6 +37,10 @@ schema.
 | OTLP and SDK ingestion | Not implemented | LangSmith clients | Braintrust clients |
 | Payload preview | Not implemented, full spans only | Not stated | Full spans |
 | Compression | SlateDB internal, raw JSON in packs | Vortex encoding | Tantivy and column encodings |
+
+Trace fetch is range-based as of the performance review: a lookup reads the
+header, the directory, and one trace block, so its cost follows trace size
+rather than segment size. See [performance.md](../performance.md).
 
 ## Gaps that matter for alpha
 

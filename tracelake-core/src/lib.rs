@@ -30,4 +30,8 @@ pub use span::{EvalScore, Span, SpanStatus, SpanType, TokenUsage, Trace};
 pub use record_pack::{
     PackField, RecordPack, RecordPackError, decode_record_pack, encode_record_pack,
 };
-pub use trace_pack::{TracePack, TracePackError, decode_trace_pack, encode_trace_pack};
+pub use trace_pack::{
+    TRACE_PACK_HEADER_LEN, TraceBlockRef, TracePack, TracePackError, TracePackHeader,
+    decode_trace_block, decode_trace_pack, decode_trace_pack_header, encode_trace_pack,
+    find_trace_block,
+};
