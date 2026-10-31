@@ -21,7 +21,8 @@ is explicitly out of scope.
 | Delete a trace or record | `DELETE /v1/traces/...`, `DELETE .../records/{id}` | delete e2e test |
 | Retention | `POST /v1/retention` with a cutoff | retention test |
 | Read limits | timeout and per-tenant cap | limiter unit tests, 429 e2e test |
-| Durable local storage | `TRACELAKE_DATA_DIR` | restart test |
+| Select an object store | `TRACELAKE_STORE=local`, `s3`, or `gcs` | `store.rs` tests |
+| Durable storage | `TRACELAKE_DATA_DIR`, or an S3 or GCS bucket | restart test, store selection tests |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 
 ## Alpha exit criteria
@@ -35,6 +36,7 @@ is explicitly out of scope.
 | Schemas can change without rewriting history | Yes | Pack field descriptors and defaults |
 | Tenant isolation at the key and path level | Yes | Isolation tests |
 | A single process can restart without data loss | Yes | Restart test |
+| Object storage is selectable at runtime | Yes | `store.rs` selection and configuration tests. S3 and GCS are compile-tested and configuration-tested; no live bucket was exercised here |
 | Request size is bounded | Yes | 32 MiB body limit |
 | A read cannot run forever | Yes | 30 s query timeout, 504 on expiry |
 | One tenant cannot starve others | Yes | 16 concurrent reads per tenant, 429 above it |
@@ -45,12 +47,13 @@ is explicitly out of scope.
 
 ## Required before the alpha tag
 
-1. S3 and GCS wiring in the server. Only the local file-system store is wired
-   today, although every store path goes through `object_store`.
-2. A dependency audit job in CI.
-3. Segment rewrite so deleted rows stop consuming space. Deletes are logically
+1. A dependency audit job in CI.
+2. Segment rewrite so deleted rows stop consuming space. Deletes are logically
    correct today; tombstones accumulate in the manifest and old segments keep
    the deleted bytes.
+3. A live S3 or GCS run in CI or a staging environment. The store selection is
+   tested and the code paths compile, but no bucket credentials are available
+   here.
 
 ## Operational notes
 
@@ -59,7 +62,14 @@ is explicitly out of scope.
   tenant name. A request over the cap gets 429. A request past the timeout gets
   504. The timeout wraps the database call; the permit is released when the call
   returns, times out, or is cancelled.
-- The server writes the hot store and segments under `TRACELAKE_DATA_DIR`.
+- `TRACELAKE_STORE` selects `local` (default), `s3`, or `gcs`.
+  `TRACELAKE_BUCKET` names the bucket. `TRACELAKE_REGION` and
+  `TRACELAKE_ENDPOINT` configure S3 or an S3-compatible server such as MinIO.
+  `TRACELAKE_PREFIX` scopes remote paths and defaults to `tracelake`.
+  Credentials come from the provider chain (`AWS_*` or `GOOGLE_*`); the server
+  never reads keys from its own settings.
+- For a local store, the server writes the hot store and segments under
+  `TRACELAKE_DATA_DIR`.
   Back up that directory or, on object storage, the bucket prefix.
 - One server process owns a data directory. Two processes against one directory
   are untested.

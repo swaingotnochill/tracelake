@@ -1,22 +1,15 @@
 //! TraceLake HTTP server entry point.
 
-use slatedb::object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use std::time::Duration;
 use tracelake_ingest::TraceLakeDb;
 use tracelake_server::limits::Limits;
+use tracelake_server::store::StoreSettings;
 use tracelake_server::{AppState, build_router};
 
 /// Address the server binds when `TRACELAKE_ADDR` is unset. Loopback is the
 /// safe default because the alpha has no authentication.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
-
-/// Directory that holds the hot store and compacted segments.
-const DEFAULT_DATA_DIR: &str = "./tracelake-data";
-
-/// Path roots inside the data directory.
-const HOT_PATH: &str = "hot";
-const SEGMENT_PATH: &str = "segments";
 
 #[tokio::main]
 async fn main() {
@@ -25,12 +18,10 @@ async fn main() {
         .parse()
         .expect("TRACELAKE_ADDR must be a valid socket address");
 
-    let data_dir = std::env::var("TRACELAKE_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.into());
-    std::fs::create_dir_all(&data_dir).expect("data directory should be creatable");
-    let store: Arc<dyn slatedb::object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&data_dir).expect("data directory should open"));
+    let settings = StoreSettings::from_env().expect("store settings should be valid");
+    let store = settings.open().expect("object store should open");
 
-    let db = TraceLakeDb::open(Arc::clone(&store), HOT_PATH)
+    let db = TraceLakeDb::open(Arc::clone(&store), &settings.hot_path())
         .await
         .expect("hot store should open");
 
@@ -38,7 +29,7 @@ async fn main() {
         query_timeout: Duration::from_millis(env_u64("TRACELAKE_QUERY_TIMEOUT_MS", 30_000)),
         max_concurrent_per_tenant: env_u64("TRACELAKE_TENANT_CONCURRENCY", 16) as usize,
     };
-    let state = AppState::with_limits(db, store, SEGMENT_PATH, limits);
+    let state = AppState::with_limits(db, store, &settings.segment_path(), limits);
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -46,7 +37,7 @@ async fn main() {
         .expect("server address should bind");
 
     println!("tracelake listening on http://{addr}");
-    println!("data directory: {data_dir}");
+    println!("store: {}", settings.describe());
     println!(
         "limits: query timeout {} ms, {} concurrent reads per tenant",
         limits.query_timeout.as_millis(),

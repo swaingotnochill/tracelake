@@ -3,6 +3,7 @@
 pub mod ingest_handler;
 pub mod limits;
 pub mod query_handler;
+pub mod store;
 pub mod table_handler;
 
 use limits::{Limits, TenantLimiter};

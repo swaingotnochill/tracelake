@@ -22,7 +22,7 @@ schema.
 
 | Capability | TraceLake today | SmithDB | Brainstore |
 |------------|-----------------|---------|------------|
-| Object storage as truth | Yes, through `object_store` | Yes | Yes |
+| Object storage as truth | Yes, local, S3, or GCS through `object_store` | Yes | Yes |
 | Hot write buffer | SlateDB LSM | LSM | Object-store WAL plus memory |
 | Trace-local row store | Trace pack keyed by trace_id, fetched by range | Yes | Row store per segment |
 | Typed record tables | Yes, with schema evolution | Yes, columnar | Semi-structured first |

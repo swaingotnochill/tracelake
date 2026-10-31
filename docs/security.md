@@ -84,4 +84,5 @@ knows that tenant's name, which is the same trust model as the rest of the alpha
 - Delete and retention with tombstones that survive compaction.
 - A dependency audit job (`cargo deny check advisories licenses`).
 - Encryption at rest is delegated to the object store, and should be stated in
-  deployment docs.
+  deployment docs. S3 and GCS use the provider credential chain; the server
+  does not read access keys from its own configuration.
