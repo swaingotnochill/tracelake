@@ -16,6 +16,10 @@ pub struct SegmentManifest {
     /// compaction only reads keys above it, so records are not copied twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<String>,
+    /// Deleted trace or record ids. A tombstone kept here masks copies that
+    /// still live in older segments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<Tombstone>,
     /// Every published segment, oldest first.
     pub segments: Vec<SegmentEntry>,
 }
@@ -156,7 +160,31 @@ impl FieldRange {
 /// they would save.
 pub const MAX_TRACKED_DISTINCT_VALUES: usize = 64;
 
+/// One deleted trace or record. Later timestamps win during a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub id: String,
+    pub deleted_at_ns: i64,
+}
+
 impl SegmentManifest {
+    /// Adds or refreshes tombstones. Ids already present keep the newer
+    /// timestamp.
+    pub fn apply_tombstones(&mut self, tombstones: &[Tombstone]) {
+        for tombstone in tombstones {
+            match self
+                .deleted
+                .iter_mut()
+                .find(|existing| existing.id == tombstone.id)
+            {
+                Some(existing) => {
+                    existing.deleted_at_ns = existing.deleted_at_ns.max(tombstone.deleted_at_ns);
+                }
+                None => self.deleted.push(tombstone.clone()),
+            }
+        }
+    }
+
     /// Creates an empty manifest for one (tenant, namespace).
     pub fn new(tenant_id: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self {
@@ -165,6 +193,7 @@ impl SegmentManifest {
             namespace: namespace.into(),
             table: None,
             watermark: None,
+            deleted: Vec::new(),
             segments: Vec::new(),
         }
     }

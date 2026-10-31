@@ -2,12 +2,12 @@ use crate::bloom_writer::build_segment_bloom;
 use crate::manifest_writer::{publish_manifest, read_manifest};
 use crate::stats_writer::build_segment_stats;
 use slatedb::object_store::{ObjectStore, path::Path};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tracelake_core::{
-    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Trace,
-    encode_span_storage_key, encode_trace_pack,
+    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span, Tombstone, TombstoneKey,
+    Trace, decode_tombstone_key, encode_span_storage_key, encode_trace_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -111,6 +111,35 @@ pub fn group_spans(spans: Vec<Span>) -> Vec<TraceGroup> {
     groups
 }
 
+/// Hot trace tombstones grouped by (tenant, namespace), with storage keys.
+type NamespaceTombstones = HashMap<(String, String), Vec<(Vec<u8>, Tombstone)>>;
+
+fn tombstone_values(tombstones: &[(Vec<u8>, Tombstone)]) -> Vec<Tombstone> {
+    tombstones
+        .iter()
+        .map(|(_, tombstone)| tombstone.clone())
+        .collect()
+}
+
+fn tombstone_keys(tombstones: &[(Vec<u8>, Tombstone)]) -> Vec<Vec<u8>> {
+    tombstones.iter().map(|(key, _)| key.clone()).collect()
+}
+
+fn deleted_ids(tombstones: &NamespaceTombstones) -> HashMap<(String, String), HashSet<String>> {
+    tombstones
+        .iter()
+        .map(|(namespace, values)| {
+            (
+                namespace.clone(),
+                values
+                    .iter()
+                    .map(|(_, tombstone)| tombstone.id.clone())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// Compacts the hot store into segments on an object store.
 ///
 /// Each compaction writes one segment per (tenant, namespace): a trace pack,
@@ -132,26 +161,72 @@ impl Compactor {
         }
     }
 
-    /// Compacts every span written since the last compaction, returning the
-    /// manifest entries written, one segment per (tenant, namespace).
+    /// Compacts every span written since the last compaction, applies
+    /// tombstones, and returns the segments written, one per namespace.
     pub async fn compact(&self, db: &TraceLakeDb) -> Result<Vec<SegmentEntry>, CompactError> {
-        let (groups, watermarks) = self.collect_pending(db).await?;
+        let tombstones = self.collect_tombstones(db).await?;
+        let deleted = deleted_ids(&tombstones);
+        let (groups, watermarks) = self.collect_pending(db, &deleted).await?;
 
         let mut written = Vec::with_capacity(groups.len());
+        let mut handled: HashSet<(String, String)> = HashSet::new();
+
         for group in &groups {
             let namespace = (group.tenant_id.clone(), group.namespace.clone());
             let watermark = watermarks.get(&namespace).map(String::as_str);
-            written.push(self.compact_group(db, group, watermark).await?);
+            let namespace_tombstones = tombstones
+                .get(&namespace)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            written.push(
+                self.compact_group(db, group, watermark, namespace_tombstones)
+                    .await?,
+            );
+            handled.insert(namespace);
+        }
+
+        for (namespace, namespace_tombstones) in &tombstones {
+            if handled.contains(namespace) {
+                continue;
+            }
+            self.persist_tombstones(db, namespace, namespace_tombstones)
+                .await?;
         }
 
         Ok(written)
     }
 
-    /// Reads spans above each namespace's watermark and groups the survivors.
-    /// The last key kept per namespace becomes the next watermark.
+    /// Hot trace tombstones grouped by namespace, with their storage keys.
+    async fn collect_tombstones(
+        &self,
+        db: &TraceLakeDb,
+    ) -> Result<NamespaceTombstones, CompactError> {
+        let mut tombstones: NamespaceTombstones = HashMap::new();
+
+        for (key, tombstone) in db.scan_all_tombstones().await? {
+            if let TombstoneKey::Trace {
+                tenant_id,
+                namespace,
+                ..
+            } = decode_tombstone_key(&key)?
+            {
+                tombstones
+                    .entry((tenant_id, namespace))
+                    .or_default()
+                    .push((key, tombstone));
+            }
+        }
+
+        Ok(tombstones)
+    }
+
+    /// Reads spans above each namespace's watermark and below no tombstone, and
+    /// groups the survivors. The last key kept per namespace becomes the next
+    /// watermark.
     async fn collect_pending(
         &self,
         db: &TraceLakeDb,
+        deleted: &HashMap<(String, String), HashSet<String>>,
     ) -> Result<(Vec<TraceGroup>, HashMap<(String, String), String>), CompactError> {
         let mut known: HashMap<(String, String), Option<String>> = HashMap::new();
         let mut last: HashMap<(String, String), String> = HashMap::new();
@@ -159,6 +234,13 @@ impl Compactor {
 
         for (key, span) in db.scan_all_spans_with_keys().await? {
             let namespace = (span.tenant_id.clone(), span.namespace.clone());
+
+            if deleted
+                .get(&namespace)
+                .is_some_and(|ids| ids.contains(&span.trace_id))
+            {
+                continue;
+            }
 
             if !known.contains_key(&namespace) {
                 let manifest = read_manifest(
@@ -187,11 +269,32 @@ impl Compactor {
         Ok((group_spans(kept), last))
     }
 
+    /// Persists tombstones for a namespace with no new spans, then removes the
+    /// hot tombstone keys.
+    async fn persist_tombstones(
+        &self,
+        db: &TraceLakeDb,
+        namespace: &(String, String),
+        tombstones: &[(Vec<u8>, Tombstone)],
+    ) -> Result<(), CompactError> {
+        let (tenant_id, namespace_name) = namespace;
+        let mut manifest = read_manifest(&self.store, &self.base_path, tenant_id, namespace_name)
+            .await?
+            .unwrap_or_else(|| SegmentManifest::new(tenant_id, namespace_name));
+
+        manifest.apply_tombstones(&tombstone_values(tombstones));
+        publish_manifest(&self.store, &self.base_path, &manifest).await?;
+
+        db.delete_keys(&tombstone_keys(tombstones)).await?;
+        Ok(())
+    }
+
     async fn compact_group(
         &self,
         db: &TraceLakeDb,
         group: &TraceGroup,
         watermark: Option<&str>,
+        tombstones: &[(Vec<u8>, Tombstone)],
     ) -> Result<SegmentEntry, CompactError> {
         let mut manifest = read_manifest(
             &self.store,
@@ -268,6 +371,7 @@ impl Compactor {
 
         manifest.segments.push(entry.clone());
         manifest.watermark = watermark.map(str::to_string);
+        manifest.apply_tombstones(&tombstone_values(tombstones));
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
 
         let keys = group
@@ -277,6 +381,7 @@ impl Compactor {
             .map(encode_span_storage_key)
             .collect::<Result<Vec<_>, _>>()?;
         db.delete_keys(&keys).await?;
+        db.delete_keys(&tombstone_keys(tombstones)).await?;
 
         Ok(entry)
     }
@@ -402,7 +507,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
         let (groups, _) = Compactor::new(store, BASE_PATH)
-            .collect_pending(&db)
+            .collect_pending(&db, &HashMap::new())
             .await
             .expect("traces should collect");
 
@@ -428,7 +533,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
         let (groups, _) = Compactor::new(store, BASE_PATH)
-            .collect_pending(&db)
+            .collect_pending(&db, &HashMap::new())
             .await
             .expect("traces should collect");
 

@@ -1,8 +1,12 @@
+use chrono::{DateTime, Utc};
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
+use std::collections::HashMap;
 use tracelake_core::{
-    KeyError, Record, Span, TableSchema, decode_record_key, encode_record_key,
-    encode_span_storage_key, namespace_prefix, record_prefix, span_root_prefix, trace_prefix,
+    KeyError, Record, Span, TableSchema, Tombstone, TombstoneKey, decode_record_key,
+    decode_tombstone_key, encode_record_key, encode_record_tombstone_key, encode_span_storage_key,
+    encode_trace_tombstone_key, namespace_prefix, record_prefix, record_tombstone_prefix,
+    span_root_prefix, tombstone_root_prefix, trace_prefix, trace_tombstone_prefix,
 };
 
 use std::sync::Arc;
@@ -74,6 +78,154 @@ impl TraceLakeDb {
     ) -> Result<Vec<Span>, IngestError> {
         let prefix = trace_prefix(tenant_id, namespace, trace_id)?;
         Self::scan_spans(&self.db, prefix).await
+    }
+
+    /// Deletes every hot span of one trace and writes a tombstone that masks
+    /// copies already published in segments. Returns the hot span count.
+    pub async fn delete_trace(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        trace_id: &str,
+    ) -> Result<usize, IngestError> {
+        let prefix = trace_prefix(tenant_id, namespace, trace_id)?;
+        let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut batch = WriteBatch::new();
+        let mut deleted = 0;
+
+        while let Some(kv) = iter.next().await? {
+            batch.delete(kv.key);
+            deleted += 1;
+        }
+
+        batch.put(
+            encode_trace_tombstone_key(tenant_id, namespace, trace_id)?,
+            deleted_at_bytes(),
+        );
+        self.db.write(batch).await?;
+
+        Ok(deleted)
+    }
+
+    /// Deletes one hot record and writes a tombstone. Returns whether a hot
+    /// copy existed; the tombstone is written either way so a compacted copy
+    /// is masked too.
+    pub async fn delete_record(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        schema: &TableSchema,
+        record_id: &str,
+    ) -> Result<bool, IngestError> {
+        let key = encode_record_key(tenant_id, namespace, &schema.table, record_id)?;
+        let existed = self.db.get(key.clone()).await?.is_some();
+
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        batch.put(
+            encode_record_tombstone_key(tenant_id, namespace, &schema.table, record_id)?,
+            deleted_at_bytes(),
+        );
+        self.db.write(batch).await?;
+
+        Ok(existed)
+    }
+
+    /// Tombstones for one namespace, with their storage keys.
+    pub async fn scan_trace_tombstones(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<(Vec<u8>, Tombstone)>, IngestError> {
+        self.scan_tombstones(trace_tombstone_prefix(tenant_id, namespace)?)
+            .await
+    }
+
+    /// Tombstones for one table, with their storage keys.
+    pub async fn scan_record_tombstones(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Vec<(Vec<u8>, Tombstone)>, IngestError> {
+        self.scan_tombstones(record_tombstone_prefix(tenant_id, namespace, table)?)
+            .await
+    }
+
+    /// Every tombstone in the hot store, with its storage key.
+    pub async fn scan_all_tombstones(&self) -> Result<Vec<(Vec<u8>, Tombstone)>, IngestError> {
+        self.scan_tombstones(tombstone_root_prefix().to_vec()).await
+    }
+
+    async fn scan_tombstones(
+        &self,
+        prefix: Vec<u8>,
+    ) -> Result<Vec<(Vec<u8>, Tombstone)>, IngestError> {
+        let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut tombstones = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            let key = decode_tombstone_key(&kv.key)?;
+            let id = match key {
+                TombstoneKey::Trace { trace_id, .. } => trace_id,
+                TombstoneKey::Record { record_id, .. } => record_id,
+            };
+            tombstones.push((
+                kv.key.to_vec(),
+                Tombstone {
+                    id,
+                    deleted_at_ns: read_deleted_at(&kv.value),
+                },
+            ));
+        }
+
+        Ok(tombstones)
+    }
+
+    /// Deletes every trace whose latest span starts before `cutoff`. Returns
+    /// the number of traces deleted. One batch is written; callers that delete
+    /// a large range should repeat the call.
+    pub async fn delete_traces_before(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, IngestError> {
+        let mut iter = self
+            .db
+            .scan_prefix(namespace_prefix(tenant_id, namespace)?)
+            .await?;
+        let mut by_trace: HashMap<String, TracePending> = HashMap::new();
+
+        while let Some(kv) = iter.next().await? {
+            let span: Span = serde_json::from_slice(&kv.value)?;
+            let entry = by_trace.entry(span.trace_id).or_default();
+            if entry.latest.is_none_or(|latest| span.start_time > latest) {
+                entry.latest = Some(span.start_time);
+            }
+            entry.keys.push(kv.key.to_vec());
+        }
+
+        let mut batch = WriteBatch::new();
+        let mut deleted = 0;
+
+        for (trace_id, pending) in by_trace {
+            if pending.latest.is_none_or(|latest| latest >= cutoff) {
+                continue;
+            }
+
+            for key in pending.keys {
+                batch.delete(key);
+            }
+            batch.put(
+                encode_trace_tombstone_key(tenant_id, namespace, &trace_id)?,
+                deleted_at_bytes(),
+            );
+            deleted += 1;
+        }
+
+        self.db.write(batch).await?;
+        Ok(deleted)
     }
 
     /// Deletes keys after their contents are published in a segment. The
@@ -221,6 +373,25 @@ impl TraceLakeDb {
 
         Ok(spans)
     }
+}
+
+#[derive(Default)]
+struct TracePending {
+    latest: Option<DateTime<Utc>>,
+    keys: Vec<Vec<u8>>,
+}
+
+fn deleted_at_bytes() -> Vec<u8> {
+    let now = Utc::now().timestamp_millis() * 1_000_000;
+    now.to_le_bytes().to_vec()
+}
+
+fn read_deleted_at(value: &[u8]) -> i64 {
+    value
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_le_bytes)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

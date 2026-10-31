@@ -1,7 +1,7 @@
 //! Write-path endpoints: span ingest and compaction.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
@@ -46,6 +46,49 @@ pub async fn post_spans(
         Json(WrittenBody {
             written: body.spans.len(),
         }),
+    ))
+}
+
+/// Deletes one trace and writes a tombstone that masks compacted copies.
+pub async fn delete_trace(
+    State(state): State<AppState>,
+    Path((tenant_id, namespace, trace_id)): Path<(String, String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorBody>)> {
+    let deleted_spans = state
+        .db
+        .delete_trace(&tenant_id, &namespace, &trace_id)
+        .await
+        .map_err(|error| ingest_error_response(&error))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "deleted_spans": deleted_spans })),
+    ))
+}
+
+/// Body of `POST /v1/retention`.
+#[derive(Debug, Deserialize)]
+pub struct RetentionBody {
+    pub tenant_id: String,
+    pub namespace: String,
+    /// Traces whose latest span starts before this instant are deleted.
+    pub before: chrono::DateTime<chrono::Utc>,
+}
+
+/// Deletes every trace that ends before a cutoff.
+pub async fn post_retention(
+    State(state): State<AppState>,
+    Json(body): Json<RetentionBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorBody>)> {
+    let deleted_traces = state
+        .db
+        .delete_traces_before(&body.tenant_id, &body.namespace, body.before)
+        .await
+        .map_err(|error| ingest_error_response(&error))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "deleted_traces": deleted_traces })),
     ))
 }
 

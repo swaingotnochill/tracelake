@@ -55,6 +55,14 @@ pub fn build_router(state: AppState) -> axum::Router {
             axum::routing::post(query_handler::post_search),
         )
         .route(
+            "/v1/traces/{tenant_id}/{namespace}/{trace_id}",
+            axum::routing::delete(ingest_handler::delete_trace),
+        )
+        .route(
+            "/v1/retention",
+            axum::routing::post(ingest_handler::post_retention),
+        )
+        .route(
             "/v1/tables/{tenant_id}/{namespace}/{table}/schema",
             axum::routing::put(table_handler::put_table_schema)
                 .get(table_handler::get_table_schema),
@@ -65,7 +73,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         )
         .route(
             "/v1/tables/{tenant_id}/{namespace}/{table}/records/{record_id}",
-            axum::routing::get(table_handler::get_record),
+            axum::routing::get(table_handler::get_record).delete(table_handler::delete_record),
         )
         .route(
             "/v1/tables/{tenant_id}/{namespace}/{table}/query",
@@ -832,6 +840,248 @@ mod tests {
             "POST",
             "/v1/tables/tenantid-1/default/findings/aggregate",
             Some(json!({ "metrics": ["count"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"][0]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn deletes_are_visible_in_every_read_path_after_compaction() {
+        let app = build_router(test_state().await);
+
+        let mut gone = example_span("trace-gone", "span-a", 1);
+        gone.status = SpanStatus::Error;
+        gone.model = Some("gpt-4o".to_string());
+        gone.output = Some(json!({ "text": "hallucination in the answer" }));
+        gone.end_time = Some(gone.start_time + chrono::Duration::milliseconds(100));
+
+        let mut kept = example_span("trace-keep", "span-a", 2);
+        kept.model = Some("gpt-4o".to_string());
+        kept.end_time = Some(kept.start_time + chrono::Duration::milliseconds(200));
+
+        let schema = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(schema),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": [gone, kept] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [
+                { "finding_id": "f-gone" },
+                { "finding_id": "f-keep" }
+            ] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/traces/tenantid-1/default/trace-gone",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/tables/tenantid-1/default/findings/records/f-gone",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A second compaction persists the tombstones in the manifests.
+        let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["segments"], json!([]));
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-gone",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-keep",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["spans"].as_array().map(Vec::len), Some(1));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/traces/search",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "status": "error"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/traces/search",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "text_query": "hallucination"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/default/findings/records/f-gone",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({ "limit": 10 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["records"].as_array().expect("records");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["finding_id"], "f-keep");
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans/aggregate",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "metrics": ["count"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["count"], 1);
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/aggregate",
+            Some(json!({ "metrics": ["count"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"][0]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_traces_before_a_cutoff() {
+        let app = build_router(test_state().await);
+
+        let old = example_span("trace-old", "span-a", 0);
+        let new = example_span("trace-new", "span-a", 5_000_000_000);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": [old, new] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/retention",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "before": "2026-06-16T10:00:02Z"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted_traces"], 1);
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-old",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-new",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-1/default/trace-old",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/spans/aggregate",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "metrics": ["count"]
+            })),
         )
         .await;
         assert_eq!(status, StatusCode::OK);

@@ -11,6 +11,9 @@ const SPAN_ROOT: &str = "v1/t/";
 /// First path segment of every user-defined record key.
 const RECORD_ROOT: &str = "v1/r/";
 
+/// First path segment of every tombstone key.
+const TOMBSTONE_ROOT: &str = "v1/d/";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Decoded components of a SlateDB span storage key.
 pub struct SpanKey {
@@ -150,6 +153,122 @@ pub fn namespace_record_prefix(tenant_id: &str, namespace: &str) -> Result<Vec<u
     validate_segment("tenant_id", tenant_id)?;
     validate_segment("namespace", namespace)?;
     Ok(format!("v1/r/t/{tenant_id}/ns/{namespace}/tb/").into_bytes())
+}
+
+/// Root shared by every tombstone key and by no span or record key.
+pub fn tombstone_root_prefix() -> &'static [u8] {
+    TOMBSTONE_ROOT.as_bytes()
+}
+
+/// Storage key for a deleted trace: `v1/d/t/{tenant}/ns/{namespace}/tr/{trace_id}`.
+pub fn encode_trace_tombstone_key(
+    tenant_id: &str,
+    namespace: &str,
+    trace_id: &str,
+) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    validate_segment("trace_id", trace_id)?;
+
+    Ok(format!("v1/d/t/{tenant_id}/ns/{namespace}/tr/{trace_id}").into_bytes())
+}
+
+/// Storage key for a deleted record:
+/// `v1/d/t/{tenant}/ns/{namespace}/tb/{table}/r/{record_id}`.
+pub fn encode_record_tombstone_key(
+    tenant_id: &str,
+    namespace: &str,
+    table: &str,
+    record_id: &str,
+) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    validate_segment("table", table)?;
+    validate_segment("record_id", record_id)?;
+
+    Ok(format!("v1/d/t/{tenant_id}/ns/{namespace}/tb/{table}/r/{record_id}").into_bytes())
+}
+
+/// Prefix that scopes every trace tombstone in one namespace.
+pub fn trace_tombstone_prefix(tenant_id: &str, namespace: &str) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    Ok(format!("v1/d/t/{tenant_id}/ns/{namespace}/tr/").into_bytes())
+}
+
+/// Prefix that scopes every record tombstone in one table.
+pub fn record_tombstone_prefix(
+    tenant_id: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    validate_segment("table", table)?;
+    Ok(format!("v1/d/t/{tenant_id}/ns/{namespace}/tb/{table}/r/").into_bytes())
+}
+
+/// Components of a decoded tombstone key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TombstoneKey {
+    Trace {
+        tenant_id: String,
+        namespace: String,
+        trace_id: String,
+    },
+    Record {
+        tenant_id: String,
+        namespace: String,
+        table: String,
+        record_id: String,
+    },
+}
+
+/// Decodes either tombstone shape.
+pub fn decode_tombstone_key(key: &[u8]) -> Result<TombstoneKey, KeyError> {
+    let key = std::str::from_utf8(key).map_err(|_| KeyError::InvalidUtf8)?;
+    let parts = key.split('/').collect::<Vec<_>>();
+
+    if parts.len() == 8
+        && parts[0] == SPAN_KEY_VERSION
+        && parts[1] == "d"
+        && parts[2] == "t"
+        && parts[4] == "ns"
+        && parts[6] == "tr"
+    {
+        validate_segment("tenant_id", parts[3])?;
+        validate_segment("namespace", parts[5])?;
+        validate_segment("trace_id", parts[7])?;
+
+        return Ok(TombstoneKey::Trace {
+            tenant_id: parts[3].to_string(),
+            namespace: parts[5].to_string(),
+            trace_id: parts[7].to_string(),
+        });
+    }
+
+    if parts.len() == 10
+        && parts[0] == SPAN_KEY_VERSION
+        && parts[1] == "d"
+        && parts[2] == "t"
+        && parts[4] == "ns"
+        && parts[6] == "tb"
+        && parts[8] == "r"
+    {
+        validate_segment("tenant_id", parts[3])?;
+        validate_segment("namespace", parts[5])?;
+        validate_segment("table", parts[7])?;
+        validate_segment("record_id", parts[9])?;
+
+        return Ok(TombstoneKey::Record {
+            tenant_id: parts[3].to_string(),
+            namespace: parts[5].to_string(),
+            table: parts[7].to_string(),
+            record_id: parts[9].to_string(),
+        });
+    }
+
+    Err(KeyError::InvalidFormat)
 }
 
 /// Encodes span identity fields into the canonical lexicographic storage key.

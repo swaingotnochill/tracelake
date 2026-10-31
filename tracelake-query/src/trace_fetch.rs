@@ -2,11 +2,13 @@
 //! with compacted segments.
 
 use slatedb::object_store::{ObjectStore, path::Path};
+use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 use tracelake_compact::{TracePackWriter, read_manifest};
 use tracelake_core::{
-    BloomFilter, KeyError, SegmentEntry, SegmentFile, SegmentFileKind, Span, Trace, trace_prefix,
+    BloomFilter, KeyError, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span,
+    Tombstone, Trace, trace_prefix,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -101,6 +103,13 @@ impl TraceLakeReader {
         trace_prefix(tenant_id, namespace, trace_id)?;
 
         let manifest = read_manifest(&self.store, &self.base_path, tenant_id, namespace).await?;
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db.scan_trace_tombstones(tenant_id, namespace).await?,
+        );
+        if deleted.contains(trace_id) {
+            return Ok(None);
+        }
 
         let mut layers: Vec<Vec<Span>> = Vec::new();
         if let Some(manifest) = manifest {
@@ -162,6 +171,25 @@ impl TraceLakeReader {
 
         Ok(self.packs.read_trace(&pack_file.path, trace_id).await?)
     }
+}
+
+/// Union of segment tombstones and hot tombstones, by id.
+pub(crate) fn tombstone_ids(
+    manifest: Option<&SegmentManifest>,
+    hot: Vec<(Vec<u8>, Tombstone)>,
+) -> HashSet<String> {
+    let mut ids: HashSet<String> = manifest
+        .map(|manifest| {
+            manifest
+                .deleted
+                .iter()
+                .map(|tombstone| tombstone.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ids.extend(hot.into_iter().map(|(_, tombstone)| tombstone.id));
+    ids
 }
 
 /// Finds one file of a kind in a segment entry.

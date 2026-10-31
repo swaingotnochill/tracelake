@@ -9,10 +9,12 @@ pub mod trace_pack;
 
 pub use bloom::{BloomError, BloomFilter, DEFAULT_FALSE_POSITIVE_RATE};
 pub use key::{
-    KeyError, MAX_SEGMENT_BYTES, RecordKey, SpanKey, decode_record_key, decode_span_key,
-    encode_record_key, encode_span_key, encode_span_storage_key, namespace_prefix,
-    namespace_record_prefix, record_prefix, record_root_prefix, span_root_prefix, tenant_prefix,
-    trace_prefix, validate_path_segment,
+    KeyError, MAX_SEGMENT_BYTES, RecordKey, SpanKey, TombstoneKey, decode_record_key,
+    decode_span_key, decode_tombstone_key, encode_record_key, encode_record_tombstone_key,
+    encode_span_key, encode_span_storage_key, encode_trace_tombstone_key, namespace_prefix,
+    namespace_record_prefix, record_prefix, record_root_prefix, record_tombstone_prefix,
+    span_root_prefix, tenant_prefix, tombstone_root_prefix, trace_prefix, trace_tombstone_prefix,
+    validate_path_segment,
 };
 
 pub use schema::{
@@ -22,7 +24,7 @@ pub use schema::{
 
 pub use segment::{
     FieldRange, MAX_TRACKED_DISTINCT_VALUES, RecordStats, SegmentEntry, SegmentFile,
-    SegmentFileKind, SegmentManifest, SegmentStats, segment_id,
+    SegmentFileKind, SegmentManifest, SegmentStats, Tombstone, segment_id,
 };
 
 pub use span::{EvalScore, Span, SpanStatus, SpanType, TokenUsage, Trace};

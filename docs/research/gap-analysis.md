@@ -30,7 +30,7 @@ schema.
 | Full-text search | Tantivy per segment, hot fallback | Inverted index | Tantivy inverted index |
 | Analytics | DataFusion over Parquet columns (this milestone) | DataFusion over Vortex | Column store |
 | Metadata store | JSON manifests in object storage | Postgres | Metadata store |
-| Deletes and retention | Not implemented | Expected | Expected |
+| Deletes and retention | Tombstones and a cutoff retention call | Expected | Expected |
 | Vector search | Not implemented, out of scope | Not stated | Yes |
 | Auth and tenancy controls | None, keys are namespaced | Enterprise controls | Per-customer partitions |
 | Stateless services | Library plus one process | Yes | Yes |
@@ -49,8 +49,9 @@ rather than segment size. See [performance.md](../performance.md).
    runs do no work and segments hold each record once. The first compaction still
    builds one segment from the whole hot buffer. Late keys below the watermark
    stay in the hot store.
-2. **No deletes or retention.** There is no way to remove a trace. A regulated
-   deployment cannot use the alpha until this exists.
+2. **Deletes are logical.** Tombstones mask deleted rows in every read path, and
+   retention deletes by cutoff, but old segments are not rewritten, so deleted
+   bytes stay on disk until a rewrite lands.
 3. **Analytics are incomplete.** Aggregation over Parquet columns is landing in
    this milestone. SmithDB and Brainstore already serve percentiles and grouped
    counts.

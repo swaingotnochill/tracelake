@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use tracelake_core::{
     FieldRange, FieldType, RecordStats, SegmentEntry, SegmentFile, SegmentFileKind,
-    SegmentManifest, SegmentStats, segment_id,
+    SegmentManifest, SegmentStats, Tombstone, segment_id,
 };
 
 /// Fixed epoch (mid-2026); deltas stay inside RFC3339-safe nanosecond range.
@@ -178,6 +178,10 @@ fn entry() -> impl Strategy<Value = SegmentEntry> {
         )
 }
 
+fn tombstone() -> impl Strategy<Value = Tombstone> {
+    (small_string(), any::<i64>()).prop_map(|(id, deleted_at_ns)| Tombstone { id, deleted_at_ns })
+}
+
 fn manifest() -> impl Strategy<Value = SegmentManifest> {
     (
         1u32..=3,
@@ -185,16 +189,20 @@ fn manifest() -> impl Strategy<Value = SegmentManifest> {
         small_string(),
         prop::option::of(small_string()),
         prop::option::of(small_string()),
+        prop::collection::vec(tombstone(), 0..=3),
         prop::collection::vec(entry(), 0..=4),
     )
         .prop_map(
-            |(version, tenant_id, namespace, table, watermark, segments)| SegmentManifest {
-                version,
-                tenant_id,
-                namespace,
-                table,
-                watermark,
-                segments,
+            |(version, tenant_id, namespace, table, watermark, deleted, segments)| {
+                SegmentManifest {
+                    version,
+                    tenant_id,
+                    namespace,
+                    table,
+                    watermark,
+                    deleted,
+                    segments,
+                }
             },
         )
 }

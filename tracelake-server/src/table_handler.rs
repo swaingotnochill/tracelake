@@ -137,6 +137,24 @@ pub async fn get_record(
     }
 }
 
+/// Deletes one record and writes a tombstone that masks compacted copies.
+pub async fn delete_record(
+    State(state): State<AppState>,
+    Path((tenant_id, namespace, table, record_id)): Path<(String, String, String, String)>,
+) -> ApiResult<Value> {
+    validate_location(&tenant_id, &namespace, &table)?;
+    tracelake_core::validate_path_segment("record_id", &record_id)
+        .map_err(|error| bad_request(error.to_string()))?;
+    let schema = load_schema(&state, &tenant_id, &namespace, &table).await?;
+    let existed = state
+        .db
+        .delete_record(&tenant_id, &namespace, &schema, &record_id)
+        .await
+        .map_err(ingest_error)?;
+
+    Ok((StatusCode::OK, Json(json!({ "deleted": existed }))))
+}
+
 /// Filters and projects one table.
 pub async fn post_record_query(
     State(state): State<AppState>,

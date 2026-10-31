@@ -4,11 +4,11 @@ use crate::manifest_writer::{publish_manifest, read_record_manifest};
 use crate::record_stats_writer::build_record_stats;
 use crate::schema_store::{put_schema, read_schema};
 use slatedb::object_store::{ObjectStore, path::Path};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracelake_core::{
-    Record, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, TableSchema,
-    encode_record_key, encode_record_pack,
+    Record, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, TableSchema, Tombstone,
+    TombstoneKey, decode_record_key, decode_tombstone_key, encode_record_key, encode_record_pack,
 };
 use tracelake_ingest::TraceLakeDb;
 
@@ -29,6 +29,7 @@ pub async fn collect_record_groups(
     db: &TraceLakeDb,
     store: &Arc<dyn ObjectStore>,
     base_path: &str,
+    deleted: &HashMap<(String, String, String), HashSet<String>>,
 ) -> Result<Vec<(RecordGroup, String)>, CompactError> {
     let mut groups: Vec<(RecordGroup, String)> = Vec::new();
     let mut known: HashMap<(String, String, String), Option<String>> = HashMap::new();
@@ -39,6 +40,14 @@ pub async fn collect_record_groups(
             stored.namespace.clone(),
             stored.table.clone(),
         );
+
+        let record_id = decode_record_key(stored.key.as_bytes())?.record_id;
+        if deleted
+            .get(&location)
+            .is_some_and(|ids| ids.contains(&record_id))
+        {
+            continue;
+        }
 
         if !known.contains_key(&location) {
             let manifest = read_record_manifest(
@@ -117,14 +126,79 @@ impl RecordCompactor {
     }
 
     pub async fn compact(&self, db: &TraceLakeDb) -> Result<Vec<SegmentEntry>, CompactError> {
-        let groups = collect_record_groups(db, &self.store, &self.base_path).await?;
+        let tombstones = self.collect_tombstones(db).await?;
+        let deleted = deleted_ids(&tombstones);
+        let groups = collect_record_groups(db, &self.store, &self.base_path, &deleted).await?;
 
         let mut written = Vec::with_capacity(groups.len());
+        let mut handled: HashSet<(String, String, String)> = HashSet::new();
+
         for (group, watermark) in &groups {
-            written.push(self.compact_group(db, group, watermark).await?);
+            let location = (
+                group.tenant_id.clone(),
+                group.namespace.clone(),
+                group.table.clone(),
+            );
+            let table_tombstones = tombstones
+                .get(&location)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            written.push(
+                self.compact_group(db, group, watermark, table_tombstones)
+                    .await?,
+            );
+            handled.insert(location);
+        }
+
+        for (location, table_tombstones) in &tombstones {
+            if handled.contains(location) {
+                continue;
+            }
+            self.persist_tombstones(db, location, table_tombstones)
+                .await?;
         }
 
         Ok(written)
+    }
+
+    async fn collect_tombstones(&self, db: &TraceLakeDb) -> Result<TableTombstones, CompactError> {
+        let mut tombstones: TableTombstones = HashMap::new();
+
+        for (key, tombstone) in db.scan_all_tombstones().await? {
+            if let TombstoneKey::Record {
+                tenant_id,
+                namespace,
+                table,
+                ..
+            } = decode_tombstone_key(&key)?
+            {
+                tombstones
+                    .entry((tenant_id, namespace, table))
+                    .or_default()
+                    .push((key, tombstone));
+            }
+        }
+
+        Ok(tombstones)
+    }
+
+    async fn persist_tombstones(
+        &self,
+        db: &TraceLakeDb,
+        location: &(String, String, String),
+        tombstones: &[(Vec<u8>, Tombstone)],
+    ) -> Result<(), CompactError> {
+        let (tenant_id, namespace, table) = location;
+        let mut manifest =
+            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table)
+                .await?
+                .unwrap_or_else(|| SegmentManifest::new_table(tenant_id, namespace, table));
+
+        manifest.apply_tombstones(&tombstone_values(tombstones));
+        publish_manifest(&self.store, &self.base_path, &manifest).await?;
+
+        db.delete_keys(&tombstone_keys(tombstones)).await?;
+        Ok(())
     }
 
     async fn compact_group(
@@ -132,6 +206,7 @@ impl RecordCompactor {
         db: &TraceLakeDb,
         group: &RecordGroup,
         watermark: &str,
+        tombstones: &[(Vec<u8>, Tombstone)],
     ) -> Result<SegmentEntry, CompactError> {
         let schema = put_schema(
             &self.store,
@@ -205,6 +280,7 @@ impl RecordCompactor {
 
         manifest.segments.push(entry.clone());
         manifest.watermark = Some(watermark.to_string());
+        manifest.apply_tombstones(&tombstone_values(tombstones));
         publish_manifest(&self.store, &self.base_path, &manifest).await?;
 
         let keys = group
@@ -226,6 +302,7 @@ impl RecordCompactor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         db.delete_keys(&keys).await?;
+        db.delete_keys(&tombstone_keys(tombstones)).await?;
 
         Ok(entry)
     }
@@ -259,6 +336,35 @@ impl RecordCompactor {
             crc32,
         })
     }
+}
+
+/// Hot record tombstones grouped by table, with storage keys.
+type TableTombstones = HashMap<(String, String, String), Vec<(Vec<u8>, Tombstone)>>;
+
+fn tombstone_values(tombstones: &[(Vec<u8>, Tombstone)]) -> Vec<Tombstone> {
+    tombstones
+        .iter()
+        .map(|(_, tombstone)| tombstone.clone())
+        .collect()
+}
+
+fn tombstone_keys(tombstones: &[(Vec<u8>, Tombstone)]) -> Vec<Vec<u8>> {
+    tombstones.iter().map(|(key, _)| key.clone()).collect()
+}
+
+fn deleted_ids(tombstones: &TableTombstones) -> HashMap<(String, String, String), HashSet<String>> {
+    tombstones
+        .iter()
+        .map(|(location, values)| {
+            (
+                location.clone(),
+                values
+                    .iter()
+                    .map(|(_, tombstone)| tombstone.id.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

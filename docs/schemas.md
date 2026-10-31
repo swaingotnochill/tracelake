@@ -162,6 +162,7 @@ of every record, which it does today because compaction does not delete hot data
 | `GET` | `/v1/tables/{tenant}/{ns}/{table}/records/{record_id}` | none |
 | `POST` | `/v1/tables/{tenant}/{ns}/{table}/query` | `RecordQuery` |
 | `POST` | `/v1/evals` | `{ "tenant_id", "namespace", "log" }` |
+| `DELETE` | `/v1/tables/{tenant}/{ns}/{table}/records/{record_id}` | none |
 | `POST` | `/v1/compact` | none |
 
 `POST /v1/compact` compacts spans and records in one call and reports both segment lists.

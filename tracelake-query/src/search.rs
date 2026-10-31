@@ -11,7 +11,7 @@ use tracelake_core::{
     namespace_prefix,
 };
 
-use crate::trace_fetch::{QueryError, TraceLakeReader};
+use crate::trace_fetch::{QueryError, TraceLakeReader, tombstone_ids};
 
 /// Default result cap when the caller does not set one.
 pub const DEFAULT_SEARCH_LIMIT: usize = 100;
@@ -97,12 +97,19 @@ impl TraceLakeReader {
             tracelake_compact::read_manifest(&self.store, &self.base_path, tenant_id, namespace)
                 .await?;
         let hot_spans = self.db.get_namespace_spans(tenant_id, namespace).await?;
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db.scan_trace_tombstones(tenant_id, namespace).await?,
+        );
         let text_hits = self
             .text_hits(manifest.as_ref(), &hot_spans, search)
             .await?;
 
         let mut by_trace: HashMap<String, HashMap<String, Span>> = HashMap::new();
         let mut keep = |span: Span| {
+            if deleted.contains(&span.trace_id) {
+                return;
+            }
             if let Some(hits) = &text_hits
                 && !hits.contains(&span.trace_id)
             {

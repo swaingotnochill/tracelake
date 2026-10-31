@@ -5,7 +5,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray,
     StringViewArray,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tracelake_compact::read_record_manifest;
 use tracelake_core::{FieldType, SegmentEntry, SegmentFileKind, TableSchema};
 
-use crate::trace_fetch::{QueryError, TraceLakeReader};
+use crate::trace_fetch::{QueryError, TraceLakeReader, tombstone_ids};
 
 pub const DEFAULT_AGGREGATE_LIMIT: usize = 100;
 
@@ -138,8 +138,20 @@ impl TraceLakeReader {
             .as_ref()
             .map(|manifest| column_paths(&manifest.segments))
             .unwrap_or_default();
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db
+                .scan_record_tombstones(tenant_id, namespace, table)
+                .await?,
+        );
 
-        self.aggregate_files(files, request, &columns).await
+        self.aggregate_files(
+            files,
+            request,
+            &columns,
+            Some((schema.primary_key.as_str(), deleted)),
+        )
+        .await
     }
 
     pub async fn aggregate_spans(
@@ -158,8 +170,13 @@ impl TraceLakeReader {
             .as_ref()
             .map(|manifest| column_paths(&manifest.segments))
             .unwrap_or_default();
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db.scan_trace_tombstones(tenant_id, namespace).await?,
+        );
 
-        self.aggregate_files(files, request, &columns).await
+        self.aggregate_files(files, request, &columns, Some(("trace_id", deleted)))
+            .await
     }
 
     async fn aggregate_files(
@@ -167,8 +184,16 @@ impl TraceLakeReader {
         files: Vec<String>,
         request: &AggregateRequest,
         columns: &BTreeMap<String, FieldType>,
+        deleted: Option<(&str, HashSet<String>)>,
     ) -> Result<AggregateResult, QueryError> {
-        let needed = needed_columns(request, columns)?;
+        let mut needed = needed_columns(request, columns)?;
+        if let Some((column, ids)) = &deleted
+            && !ids.is_empty()
+            && !needed.iter().any(|(name, _)| name == column)
+        {
+            needed.push((column.to_string(), require_field(columns, column)?));
+        }
+
         if files.is_empty() {
             return Ok(AggregateResult {
                 rows: Vec::new(),
@@ -180,6 +205,24 @@ impl TraceLakeReader {
         let dir = TempDir::new().map_err(aggregate_error)?;
         let context = SessionContext::new();
         let mut unions: Vec<String> = Vec::with_capacity(files.len());
+
+        let exclude = match &deleted {
+            Some((column, ids)) if !ids.is_empty() => {
+                let schema = std::sync::Arc::new(ArrowSchema::new(vec![Field::new(
+                    "id",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let ids = StringArray::from(ids.iter().cloned().collect::<Vec<_>>());
+                let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(ids)])
+                    .map_err(aggregate_error)?;
+                context
+                    .register_batch("tombstones", batch)
+                    .map_err(aggregate_error)?;
+                Some(*column)
+            }
+            _ => None,
+        };
 
         for (index, file) in files.iter().enumerate() {
             let bytes = self
@@ -205,7 +248,7 @@ impl TraceLakeReader {
             unions.push(select_list(&needed, &available, &table));
         }
 
-        let sql = build_sql(request, &unions);
+        let sql = build_sql(request, &unions, exclude);
         let batches = context
             .sql(&sql)
             .await
@@ -326,7 +369,7 @@ fn select_list(needed: &[(String, FieldType)], available: &HashSet<String>, tabl
     format!("SELECT {} FROM {table}", columns.join(", "))
 }
 
-fn build_sql(request: &AggregateRequest, unions: &[String]) -> String {
+fn build_sql(request: &AggregateRequest, unions: &[String], exclude: Option<&str>) -> String {
     let group: Vec<String> = request.group_by.iter().map(|field| quote(field)).collect();
     let metrics: Vec<String> = request
         .metrics
@@ -339,6 +382,13 @@ fn build_sql(request: &AggregateRequest, unions: &[String]) -> String {
     let mut sql = format!("SELECT {} FROM (", select.join(", "));
     sql.push_str(&unions.join(" UNION ALL "));
     sql.push(')');
+
+    if let Some(column) = exclude {
+        sql.push_str(&format!(
+            " WHERE {} NOT IN (SELECT \"id\" FROM tombstones)",
+            quote(column)
+        ));
+    }
 
     if !group.is_empty() {
         sql.push_str(&format!(" GROUP BY {}", group.join(", ")));
@@ -523,12 +573,16 @@ mod tests {
 
     #[test]
     fn sql_groups_orders_and_limits() {
-        let sql = build_sql(&request(), &["SELECT 1".to_string()]);
+        let sql = build_sql(&request(), &["SELECT 1".to_string()], None);
 
         assert!(sql.contains("GROUP BY \"model\""));
         assert!(sql.contains("ORDER BY \"model\""));
         assert!(sql.contains("LIMIT 10"));
         assert!(sql.contains("approx_percentile_cont(\"latency_ms\", 0.95) AS p95_latency_ms"));
+        assert!(
+            build_sql(&request(), &["SELECT 1".to_string()], Some("trace_id"))
+                .contains("WHERE \"trace_id\" NOT IN (SELECT \"id\" FROM tombstones)")
+        );
     }
 
     #[test]

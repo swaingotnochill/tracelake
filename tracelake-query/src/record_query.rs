@@ -11,7 +11,7 @@ use tracelake_core::{
     SegmentFileKind, TableSchema, typed_value,
 };
 
-use crate::trace_fetch::{QueryError, TraceLakeReader};
+use crate::trace_fetch::{QueryError, TraceLakeReader, tombstone_ids};
 
 /// Default result cap when the caller does not set one.
 pub const DEFAULT_RECORD_LIMIT: usize = 100;
@@ -155,10 +155,20 @@ impl TraceLakeReader {
             .map(|field| field.name.as_str())
             .collect();
 
+        let manifest =
+            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?;
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db
+                .scan_record_tombstones(tenant_id, namespace, table)
+                .await?,
+        );
+        if deleted.contains(record_id) {
+            return Ok(None);
+        }
+
         let mut found = None;
-        if let Some(manifest) =
-            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?
-        {
+        if let Some(manifest) = manifest {
             for entry in &manifest.segments {
                 if !self.segment_may_hold(entry, record_id).await? {
                     continue;
@@ -207,9 +217,16 @@ impl TraceLakeReader {
         let mut scanned_segments = 0;
         let mut pruned_segments = 0;
 
-        if let Some(manifest) =
-            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?
-        {
+        let manifest =
+            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?;
+        let deleted = tombstone_ids(
+            manifest.as_ref(),
+            self.db
+                .scan_record_tombstones(tenant_id, namespace, table)
+                .await?,
+        );
+
+        if let Some(manifest) = manifest {
             let packs = RecordPackReader::new(std::sync::Arc::clone(&self.store));
 
             for entry in &manifest.segments {
@@ -226,6 +243,9 @@ impl TraceLakeReader {
                     .await?
                 {
                     let record_id = schema.record_id(&record)?;
+                    if deleted.contains(&record_id) {
+                        continue;
+                    }
                     by_id.insert(record_id, record);
                 }
             }
@@ -238,6 +258,9 @@ impl TraceLakeReader {
         {
             schema.fill_defaults(&mut record);
             let record_id = schema.record_id(&record)?;
+            if deleted.contains(&record_id) {
+                continue;
+            }
             by_id.insert(record_id, record);
         }
 

@@ -18,6 +18,8 @@ is explicitly out of scope.
 | Write and query records | `POST .../records`, `GET .../records/{id}`, `POST .../query` | `record_query` tests |
 | Aggregate records | `POST .../aggregate` | `aggregate.rs`, server e2e |
 | Ingest inspect-ai evals | `POST /v1/evals` | `inspect_ai.rs`, example log |
+| Delete a trace or record | `DELETE /v1/traces/...`, `DELETE .../records/{id}` | delete e2e test |
+| Retention | `POST /v1/retention` with a cutoff | retention test |
 | Durable local storage | `TRACELAKE_DATA_DIR` | restart test |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 
@@ -34,20 +36,19 @@ is explicitly out of scope.
 | A single process can restart without data loss | Yes | Restart test |
 | Request size is bounded | Yes | 32 MiB body limit |
 | Compaction does not duplicate records | Yes | Watermark plus hot-key deletion; repeat-compaction test |
-| Deletes and retention exist | No | Alpha blocker for regulated data |
+| Deletes and retention exist | Yes | Tombstones mask compacted copies; delete and retention tests |
 | Authentication exists | No | Loopback bind only |
 | Query timeouts and limits exist | No | Broad queries can run long |
 
 ## Required before the alpha tag
 
-1. A delete path with tombstones that survive compaction and retention windows.
-2. A query timeout and a per-tenant concurrency cap.
-3. S3 and GCS wiring in the server. Only the local file-system store is wired
+1. A query timeout and a per-tenant concurrency cap.
+2. S3 and GCS wiring in the server. Only the local file-system store is wired
    today, although every store path goes through `object_store`.
-4. A dependency audit job in CI.
-
-The delete path changes the storage format, so it should land before any
-external alpha user writes data.
+3. A dependency audit job in CI.
+4. Segment rewrite so deleted rows stop consuming space. Deletes are logically
+   correct today; tombstones accumulate in the manifest and old segments keep
+   the deleted bytes.
 
 ## Operational notes
 
@@ -63,6 +64,10 @@ external alpha user writes data.
   store and is served from there. It is not copied into a segment. This keeps
   late data readable while hot data is retained, and is a limitation once hot
   retention exists.
+- Deletes write a tombstone under `v1/d/`, remove the hot copy, and mask
+  compacted copies. Compaction folds tombstones into the manifest. Retention
+  deletes traces whose latest span starts before the cutoff; it does not rewrite
+  old segments, so deleted bytes stay on disk until a segment rewrite lands.
 - Bind to loopback or a private network. There is no authentication.
 
 ## Out of scope for alpha
