@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracelake_core::{
     KeyError, Record, Span, TableSchema, Tombstone, TombstoneKey, decode_record_key,
     decode_tombstone_key, encode_record_key, encode_record_tombstone_key, encode_span_storage_key,
@@ -29,6 +30,7 @@ pub struct StoredRecord {
 #[derive(Clone)]
 pub struct TraceLakeDb {
     db: Db,
+    writes: Arc<AtomicU64>,
 }
 
 impl TraceLakeDb {
@@ -37,12 +39,25 @@ impl TraceLakeDb {
     pub async fn open(object_store: Arc<dyn ObjectStore>, path: &str) -> Result<Self, IngestError> {
         let db = Db::builder(path, object_store).build().await?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            writes: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Opens a TraceLake database backed by SlateDB's in-memory object store.
     pub async fn open_in_memory(path: &str) -> Result<Self, IngestError> {
         Self::open(Arc::new(InMemory::new()), path).await
+    }
+
+    /// Monotonic counter of writes to this hot store. Readers use it to know
+    /// when a cached hot-text index is stale.
+    pub fn write_version(&self) -> u64 {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    fn record_write(&self) {
+        self.writes.fetch_add(1, Ordering::Release);
     }
 
     /// Writes one span under its canonical TraceLake storage key.
@@ -51,6 +66,7 @@ impl TraceLakeDb {
         let value = serde_json::to_vec(span)?;
 
         self.db.put(key, value).await?;
+        self.record_write();
 
         Ok(())
     }
@@ -66,6 +82,7 @@ impl TraceLakeDb {
         }
 
         self.db.write(batch).await?;
+        self.record_write();
         Ok(())
     }
 
@@ -103,6 +120,7 @@ impl TraceLakeDb {
             deleted_at_bytes(),
         );
         self.db.write(batch).await?;
+        self.record_write();
 
         Ok(deleted)
     }
@@ -127,6 +145,7 @@ impl TraceLakeDb {
             deleted_at_bytes(),
         );
         self.db.write(batch).await?;
+        self.record_write();
 
         Ok(existed)
     }
@@ -225,6 +244,7 @@ impl TraceLakeDb {
         }
 
         self.db.write(batch).await?;
+        self.record_write();
         Ok(deleted)
     }
 
@@ -241,6 +261,7 @@ impl TraceLakeDb {
             batch.delete(key.clone());
         }
         self.db.write(batch).await?;
+        self.record_write();
 
         Ok(())
     }
@@ -300,6 +321,7 @@ impl TraceLakeDb {
         }
 
         self.db.write(batch).await?;
+        self.record_write();
         Ok(())
     }
 

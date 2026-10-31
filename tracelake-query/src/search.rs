@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::path::Path;
 use std::collections::{HashMap, HashSet};
-use tracelake_compact::{build_text_index, group_spans, search_text_index};
+use std::sync::Arc;
+use tracelake_compact::{build_cached_text_index, group_spans, search_index, search_text_index};
 use tracelake_core::{
     SegmentEntry, SegmentFileKind, SegmentStats, Span, SpanStatus, Trace, decode_trace_pack,
     namespace_prefix,
@@ -102,7 +103,7 @@ impl TraceLakeReader {
             self.db.scan_trace_tombstones(tenant_id, namespace).await?,
         );
         let text_hits = self
-            .text_hits(manifest.as_ref(), &hot_spans, search)
+            .text_hits(tenant_id, namespace, manifest.as_ref(), &hot_spans, search)
             .await?;
 
         let mut by_trace: HashMap<String, HashMap<String, Span>> = HashMap::new();
@@ -159,6 +160,8 @@ impl TraceLakeReader {
     /// hot store. `None` when the query has no text term.
     async fn text_hits(
         &self,
+        tenant_id: &str,
+        namespace: &str,
         manifest: Option<&tracelake_core::SegmentManifest>,
         hot_spans: &[Span],
         search: &TraceSearch,
@@ -180,7 +183,10 @@ impl TraceLakeReader {
             }
         }
 
-        hits.extend(search_hot_text(hot_spans, text_query, search.limit)?);
+        hits.extend(
+            self.hot_text_hits(tenant_id, namespace, hot_spans, text_query, search.limit)
+                .await?,
+        );
 
         Ok(Some(hits))
     }
@@ -244,27 +250,41 @@ impl TraceLakeReader {
     }
 }
 
-/// Builds a throwaway index over the hot store so the newest spans are
-/// searchable before compaction. Hot data is memtable-sized, and compaction
-/// moves it into an indexed segment.
-fn search_hot_text(
-    hot_spans: &[Span],
-    text_query: &str,
-    limit: usize,
-) -> Result<HashSet<String>, QueryError> {
-    if hot_spans.is_empty() {
-        return Ok(HashSet::new());
+/// Hot text hits for one namespace, reusing a cached index until the hot store
+/// changes.
+impl TraceLakeReader {
+    async fn hot_text_hits(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        hot_spans: &[Span],
+        text_query: &str,
+        limit: usize,
+    ) -> Result<HashSet<String>, QueryError> {
+        if hot_spans.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let key = (tenant_id.to_string(), namespace.to_string());
+        let version = self.db.write_version();
+        let index = match self.hot_text.cached(&key, version) {
+            Some(index) => index,
+            None => {
+                let traces: Vec<Trace> = group_spans(hot_spans.to_vec())
+                    .into_iter()
+                    .flat_map(|group| group.traces)
+                    .collect();
+                let built = Arc::new(build_cached_text_index(&traces)?);
+                self.hot_text.record_build();
+                self.hot_text.store(key, version, Arc::clone(&built));
+                built
+            }
+        };
+
+        Ok(search_index(index.index(), text_query, limit)?
+            .into_iter()
+            .collect())
     }
-
-    let traces: Vec<Trace> = group_spans(hot_spans.to_vec())
-        .into_iter()
-        .flat_map(|group| group.traces)
-        .collect();
-    let bytes = build_text_index(&traces)?;
-
-    Ok(search_text_index(&bytes, text_query, limit)?
-        .into_iter()
-        .collect())
 }
 
 /// Whether a segment's stats leave any possibility of a matching span for
@@ -769,6 +789,54 @@ mod tests {
 
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].trace_id, "trace-hot");
+    }
+
+    #[tokio::test]
+    async fn repeated_text_searches_reuse_the_hot_index() {
+        let mut hot = make_span("trace-hot", "span-a", 1);
+        hot.output = Some(json!({ "text": "hallucination in the answer" }));
+        let reader = reader_with_hot(&[hot]).await;
+        let query = TraceSearch {
+            text_query: Some("hallucination".to_string()),
+            ..TraceSearch::default()
+        };
+
+        let first = reader
+            .search_traces("tenantid-1", "default", &query)
+            .await
+            .expect("first search");
+        assert_eq!(first.len(), 1);
+        assert_eq!(reader.hot_text_index_builds(), 1);
+
+        let second = reader
+            .search_traces("tenantid-1", "default", &query)
+            .await
+            .expect("second search");
+        assert_eq!(second, first);
+        assert_eq!(
+            reader.hot_text_index_builds(),
+            1,
+            "a repeated search reuses the index"
+        );
+
+        let mut fresh = make_span("trace-new", "span-a", 2);
+        fresh.output = Some(json!({ "text": "hallucination again" }));
+        reader
+            .db
+            .put_spans(std::slice::from_ref(&fresh))
+            .await
+            .expect("fresh span writes");
+
+        let third = reader
+            .search_traces("tenantid-1", "default", &query)
+            .await
+            .expect("third search");
+        assert_eq!(third.len(), 2);
+        assert_eq!(
+            reader.hot_text_index_builds(),
+            2,
+            "a write invalidates the cached index"
+        );
     }
 
     #[tokio::test]

@@ -23,7 +23,8 @@ pub use record_stats_writer::build_record_stats;
 pub use schema_store::{put_schema, read_schema};
 pub use stats_writer::build_segment_stats;
 pub use text_indexer::{
-    MAX_INDEXED_TEXT_BYTES, TextIndexError, build_text_index, search_text_index,
+    CachedTextIndex, MAX_INDEXED_TEXT_BYTES, TextIndexError, build_cached_text_index,
+    build_text_index, search_index, search_text_index,
 };
 pub use trace_pack_writer::TracePackWriter;
 

@@ -2,10 +2,11 @@
 //! with compacted segments.
 
 use slatedb::object_store::{ObjectStore, path::Path};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracelake_compact::{TracePackWriter, read_manifest};
+use tracelake_compact::{CachedTextIndex, TracePackWriter, read_manifest};
 use tracelake_core::{
     BloomFilter, KeyError, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, Span,
     Tombstone, Trace, trace_prefix,
@@ -63,14 +64,62 @@ pub enum QueryError {
     Aggregate { reason: String },
 }
 
+/// How many namespaces may keep a hot text index. Beyond this the cache is
+/// cleared, which bounds memory when a process serves many namespaces.
+const MAX_CACHED_HOT_INDEXES: usize = 32;
+
+type HotTextEntries = HashMap<(String, String), (u64, Arc<CachedTextIndex>)>;
+
+/// Hot text indexes keyed by tenant and namespace, invalidated by the hot
+/// store's write version.
+#[derive(Default)]
+pub(crate) struct HotTextCache {
+    builds: AtomicU64,
+    entries: Mutex<HotTextEntries>,
+}
+
+impl HotTextCache {
+    pub(crate) fn cached(
+        &self,
+        key: &(String, String),
+        version: u64,
+    ) -> Option<Arc<CachedTextIndex>> {
+        let entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        entries.get(key).and_then(|(cached_version, index)| {
+            (*cached_version == version).then(|| Arc::clone(index))
+        })
+    }
+
+    pub(crate) fn store(&self, key: (String, String), version: u64, index: Arc<CachedTextIndex>) {
+        let mut entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if entries.len() >= MAX_CACHED_HOT_INDEXES {
+            entries.clear();
+        }
+        entries.insert(key, (version, index));
+    }
+
+    pub(crate) fn record_build(&self) {
+        self.builds.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Reads traces by merging the hot SlateDB store with compacted segments.
-/// Cloning shares the hot store and segment store handles.
+/// Cloning shares the hot store, segment store handles, and hot text cache.
 #[derive(Clone)]
 pub struct TraceLakeReader {
     pub(crate) db: TraceLakeDb,
     pub(crate) store: Arc<dyn ObjectStore>,
     pub(crate) packs: TracePackWriter,
     pub(crate) base_path: String,
+    pub(crate) hot_text: Arc<HotTextCache>,
 }
 
 impl TraceLakeReader {
@@ -82,7 +131,14 @@ impl TraceLakeReader {
             packs: TracePackWriter::new(Arc::clone(&store)),
             store,
             base_path: base_path.into(),
+            hot_text: Arc::new(HotTextCache::default()),
         }
+    }
+
+    /// Number of hot text indexes built by this reader. A repeated search with
+    /// no writes between leaves it unchanged.
+    pub fn hot_text_index_builds(&self) -> u64 {
+        self.hot_text.builds.load(Ordering::Relaxed)
     }
 
     /// Fetches one full trace by id.

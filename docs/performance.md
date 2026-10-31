@@ -74,9 +74,10 @@ That is about 60 times faster at 46 MB, and the cost now follows the trace.
   above the namespace watermark and deletes those hot keys, so repeat runs do no
   work. One run still builds one segment, so segment size follows the hot
   buffer.
-- **Text search over hot data builds an index per query.** It is correct, not
-  cheap. Compaction moves data into indexed segments, after which text search
-  reads one segment index object per segment.
+- **Text search over hot data caches one index per namespace.** The first search
+  after a hot write rebuilds it; repeated searches with no writes reuse it. The
+  benchmark's text search runs after compaction, so it measures the segment
+  index, not the hot cache.
 - **Aggregation has no filter pushdown.** A filtered aggregate reads every
   column file for the table.
 - **No query timeout or concurrency cap.** A broad query can occupy a core for

@@ -72,7 +72,22 @@ fn text_schema() -> TextSchema {
 
 /// Builds a Tantivy index over every span's name, input, output, and error, and
 /// serializes it into one object that can be stored beside a segment.
-pub fn build_text_index(traces: &[Trace]) -> Result<Vec<u8>, TextIndexError> {
+/// A built index that stays open. The hot-store cache holds one of these per
+/// namespace and searches it directly, so repeated queries do not rebuild or
+/// unpack anything.
+pub struct CachedTextIndex {
+    _dir: TempDir,
+    index: Index,
+}
+
+impl CachedTextIndex {
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
+}
+
+/// Builds an index in a temporary directory that the result keeps alive.
+pub fn build_cached_text_index(traces: &[Trace]) -> Result<CachedTextIndex, TextIndexError> {
     let dir = TempDir::new()?;
     let fields = text_schema();
     let index = Index::create_in_dir(dir.path(), fields.schema.clone())?;
@@ -94,25 +109,28 @@ pub fn build_text_index(traces: &[Trace]) -> Result<Vec<u8>, TextIndexError> {
     writer.commit()?;
     writer.wait_merging_threads()?;
 
-    collect_container(dir.path())
+    Ok(CachedTextIndex { _dir: dir, index })
 }
 
-/// Runs one text query against a serialized index and returns matching
-/// trace_ids, best score first.
-pub fn search_text_index(
-    bytes: &[u8],
+/// Builds a Tantivy index over every span's name, input, output, and error, and
+/// serializes it into one object that can be stored beside a segment.
+pub fn build_text_index(traces: &[Trace]) -> Result<Vec<u8>, TextIndexError> {
+    let cached = build_cached_text_index(traces)?;
+    collect_container(cached._dir.path())
+}
+
+/// Runs one text query against an open index and returns matching trace_ids,
+/// best score first.
+pub fn search_index(
+    index: &Index,
     text_query: &str,
     limit: usize,
 ) -> Result<Vec<String>, TextIndexError> {
-    let dir = TempDir::new()?;
-    unpack_container(bytes, dir.path())?;
-
     let fields = text_schema();
-    let index = Index::open_in_dir(dir.path())?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let parser = QueryParser::for_index(
-        &index,
+        index,
         vec![fields.name, fields.input, fields.output, fields.error],
     );
     let query = parser.parse_query(text_query)?;
@@ -134,6 +152,20 @@ pub fn search_text_index(
     }
 
     Ok(trace_ids)
+}
+
+/// Runs one text query against a serialized index and returns matching
+/// trace_ids, best score first.
+pub fn search_text_index(
+    bytes: &[u8],
+    text_query: &str,
+    limit: usize,
+) -> Result<Vec<String>, TextIndexError> {
+    let dir = TempDir::new()?;
+    unpack_container(bytes, dir.path())?;
+
+    let index = Index::open_in_dir(dir.path())?;
+    search_index(&index, text_query, limit)
 }
 
 fn clip(text: &str) -> String {

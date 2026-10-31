@@ -60,9 +60,9 @@ rather than segment size. See [performance.md](../performance.md).
    one object store is untested.
 5. **No OTLP or SDK.** Every client must speak the JSON API. This blocks the
    common adoption path.
-6. **Text search over hot data is expensive.** It builds an index per query.
-   SmithDB indexes at L0 and Brainstore indexes the WAL, so neither pays that
-   cost.
+6. **Text search over hot data caches one index per namespace.** It rebuilds
+   after a hot write. SmithDB and Brainstore index at L0 and in the WAL, so
+   their first search after a write does not pay a full rebuild.
 
 ## Gaps that can wait
 

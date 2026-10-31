@@ -24,6 +24,7 @@ is explicitly out of scope.
 | Dependency advisories | `audit` CI workflow | `.github/workflows/audit.yml` |
 | Select an object store | `TRACELAKE_STORE=local`, `s3`, or `gcs` | `store.rs` tests |
 | Change a field's type | register the new type | migration e2e test |
+| Cache hot text index | automatic | index-reuse test |
 | Durable storage | `TRACELAKE_DATA_DIR`, or an S3 or GCS bucket | restart test, store selection tests |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 
@@ -34,6 +35,7 @@ is explicitly out of scope.
 | Every write is durable before the client sees 200 | Yes | SlateDB WAL; restart test |
 | A trace fetch reads one pack and skips absent traces with bloom filters | Yes | Bloom-negative test. Segments are read as three ranges, so cost follows trace size, measured at 0.14 to 0.17 ms per trace |
 | A search can skip a segment without reading it | Yes | Deleted-pack proofs |
+| Repeated text searches over hot data reuse one index | Yes | The reader caches one index per namespace until a write; `repeated_text_searches_reuse_the_hot_index` |
 | Analytics do not deserialize rows | Yes | Parquet columns and DataFusion |
 | Schemas can change without rewriting history | Yes | Pack field descriptors and defaults |
 | Tenant isolation at the key and path level | Yes | Isolation tests |
@@ -81,6 +83,9 @@ is explicitly out of scope.
   store and is served from there. It is not copied into a segment. This keeps
   late data readable while hot data is retained, and is a limitation once hot
   retention exists.
+- Text search over the hot store keeps one index per tenant and namespace in
+  memory. Any hot write invalidates it, and the next search rebuilds it once.
+  The cache holds at most 32 namespaces; past that it is cleared.
 - Deletes write a tombstone under `v1/d/`, remove the hot copy, and mask
   compacted copies. Compaction folds tombstones into the manifest, rewrites any
   segment whose bloom names a tombstoned id, drops the deleted rows, removes a
