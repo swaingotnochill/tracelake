@@ -27,6 +27,9 @@ pub enum QueryError {
     #[error("trace pack decode failed: {0}")]
     Pack(#[from] tracelake_core::TracePackError),
 
+    #[error("record pack decode failed: {0}")]
+    RecordPack(#[from] tracelake_core::RecordPackError),
+
     #[error("bloom filter decode failed: {0}")]
     Bloom(#[from] tracelake_core::BloomError),
 
@@ -38,6 +41,18 @@ pub enum QueryError {
         segment_id: String,
         kind: &'static str,
     },
+
+    #[error("segment {segment_id} lists no record pack")]
+    MissingRecordPack { segment_id: String },
+
+    #[error("table '{table}' has no registered schema")]
+    SchemaMissing { table: String },
+
+    #[error("query is invalid: {reason}")]
+    InvalidQuery { reason: String },
+
+    #[error("record does not match its schema: {0}")]
+    Record(#[from] tracelake_core::RecordError),
 }
 
 /// Reads traces by merging the hot SlateDB store with compacted segments.
