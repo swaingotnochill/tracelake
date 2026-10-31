@@ -18,6 +18,24 @@ pub enum CompactError {
     #[error("trace pack encode failed: {0}")]
     Pack(#[from] tracelake_core::TracePackError),
 
+    #[error("record pack failed: {0}")]
+    RecordPack(#[from] tracelake_core::RecordPackError),
+
+    #[error("record does not match its schema: {0}")]
+    Record(#[from] tracelake_core::RecordError),
+
+    #[error("schema shape is invalid: {0}")]
+    Schema(#[from] tracelake_core::SchemaError),
+
+    #[error("table '{table}' has no registered schema")]
+    SchemaNotFound { table: String },
+
+    #[error("table '{table}' already has a different registered schema")]
+    SchemaConflict { table: String },
+
+    #[error("segment {segment_id} lists no record pack")]
+    MissingRecordPack { segment_id: String },
+
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -168,6 +186,7 @@ impl Compactor {
             span_count: stats.span_count,
             files: vec![pack_file, bloom_file, stats_file],
             stats,
+            record_stats: None,
         };
 
         manifest.segments.push(entry.clone());
