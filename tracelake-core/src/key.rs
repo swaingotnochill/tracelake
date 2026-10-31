@@ -4,6 +4,13 @@ use thiserror::Error;
 const SPAN_KEY_VERSION: &str = "v1";
 const TIMESTAMP_WIDTH: usize = 20;
 
+/// First path segment of every span key. Records live under a disjoint root
+/// so a span scan can never deserialize a record value.
+const SPAN_ROOT: &str = "v1/t/";
+
+/// First path segment of every user-defined record key.
+const RECORD_ROOT: &str = "v1/r/";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Decoded components of a SlateDB span storage key.
 pub struct SpanKey {
@@ -12,6 +19,15 @@ pub struct SpanKey {
     pub trace_id: String,
     pub start_time_ns: i64,
     pub span_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded components of a SlateDB record storage key.
+pub struct RecordKey {
+    pub tenant_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub record_id: String,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,6 +53,90 @@ pub enum KeyError {
 
     #[error("timestamp is outside supported nanosecond range")]
     TimestampOutOfRange,
+}
+
+/// Returns the byte prefix shared by every span key and by no record key.
+pub fn span_root_prefix() -> &'static [u8] {
+    SPAN_ROOT.as_bytes()
+}
+
+/// Returns the byte prefix shared by every record key and by no span key.
+pub fn record_root_prefix() -> &'static [u8] {
+    RECORD_ROOT.as_bytes()
+}
+
+/// Builds the canonical storage key for one user-defined record:
+/// `v1/r/t/{tenant}/ns/{namespace}/tb/{table}/r/{record_id}`.
+pub fn encode_record_key(
+    tenant_id: &str,
+    namespace: &str,
+    table: &str,
+    record_id: &str,
+) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    validate_segment("table", table)?;
+    validate_segment("record_id", record_id)?;
+
+    let mut key = Vec::with_capacity(
+        RECORD_ROOT.len() + tenant_id.len() + namespace.len() + table.len() + record_id.len() + 22,
+    );
+    key.extend_from_slice(RECORD_ROOT.as_bytes());
+    key.extend_from_slice(b"t/");
+    key.extend_from_slice(tenant_id.as_bytes());
+    key.extend_from_slice(b"/ns/");
+    key.extend_from_slice(namespace.as_bytes());
+    key.extend_from_slice(b"/tb/");
+    key.extend_from_slice(table.as_bytes());
+    key.extend_from_slice(b"/r/");
+    key.extend_from_slice(record_id.as_bytes());
+
+    Ok(key)
+}
+
+/// Decodes a record storage key into its tenant, namespace, table, and record
+/// id.
+pub fn decode_record_key(key: &[u8]) -> Result<RecordKey, KeyError> {
+    let key = std::str::from_utf8(key).map_err(|_| KeyError::InvalidUtf8)?;
+    let parts = key.split('/').collect::<Vec<_>>();
+
+    if parts.len() != 10
+        || parts[0] != SPAN_KEY_VERSION
+        || parts[1] != "r"
+        || parts[2] != "t"
+        || parts[4] != "ns"
+        || parts[6] != "tb"
+        || parts[8] != "r"
+    {
+        return Err(KeyError::InvalidFormat);
+    }
+
+    validate_segment("tenant_id", parts[3])?;
+    validate_segment("namespace", parts[5])?;
+    validate_segment("table", parts[7])?;
+    validate_segment("record_id", parts[9])?;
+
+    Ok(RecordKey {
+        tenant_id: parts[3].to_string(),
+        namespace: parts[5].to_string(),
+        table: parts[7].to_string(),
+        record_id: parts[9].to_string(),
+    })
+}
+
+/// Returns the byte prefix that scopes all records of one table.
+pub fn record_prefix(tenant_id: &str, namespace: &str, table: &str) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    validate_segment("table", table)?;
+    Ok(format!("v1/r/t/{tenant_id}/ns/{namespace}/tb/{table}/r/").into_bytes())
+}
+
+/// Returns the byte prefix that scopes every record in one namespace.
+pub fn namespace_record_prefix(tenant_id: &str, namespace: &str) -> Result<Vec<u8>, KeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("namespace", namespace)?;
+    Ok(format!("v1/r/t/{tenant_id}/ns/{namespace}/tb/").into_bytes())
 }
 
 /// Encodes span identity fields into the canonical lexicographic storage key.
@@ -363,6 +463,94 @@ mod tests {
                 .timestamp_nanos_opt()
                 .ok_or(KeyError::TimestampOutOfRange)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn record_key_round_trips() {
+        let encoded = encode_record_key("tenant-1", "default", "eval_samples", "sample-7")
+            .expect("record key should encode");
+
+        assert_eq!(
+            decode_record_key(&encoded).expect("record key should decode"),
+            RecordKey {
+                tenant_id: "tenant-1".to_string(),
+                namespace: "default".to_string(),
+                table: "eval_samples".to_string(),
+                record_id: "sample-7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn record_keys_sort_by_table_then_record_id() {
+        let mut keys = [
+            encode_record_key("tenant-1", "default", "samples", "record-2").unwrap(),
+            encode_record_key("tenant-1", "default", "samples", "record-1").unwrap(),
+            encode_record_key("tenant-1", "default", "other", "record-0").unwrap(),
+        ];
+
+        keys.sort();
+
+        let decoded = keys
+            .iter()
+            .map(|key| decode_record_key(key).unwrap())
+            .collect::<Vec<_>>();
+        let order: Vec<(&str, &str)> = decoded
+            .iter()
+            .map(|key| (key.table.as_str(), key.record_id.as_str()))
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                ("other", "record-0"),
+                ("samples", "record-1"),
+                ("samples", "record-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_prefixes_match_expected_key_scopes() {
+        let key = encode_record_key("tenant-1", "default", "samples", "record-1").unwrap();
+
+        assert!(key.starts_with(record_root_prefix()));
+        assert!(key.starts_with(&record_prefix("tenant-1", "default", "samples").unwrap()));
+        assert!(key.starts_with(&namespace_record_prefix("tenant-1", "default").unwrap()));
+        assert!(!key.starts_with(&record_prefix("tenant-1", "default", "other").unwrap()));
+    }
+
+    #[test]
+    fn span_and_record_roots_never_overlap() {
+        let span_key = encode_span_key("tenant-1", "default", "trace-1", 1, "span-1").unwrap();
+        let record_key = encode_record_key("tenant-1", "default", "samples", "record-1").unwrap();
+
+        assert!(span_key.starts_with(span_root_prefix()));
+        assert!(record_key.starts_with(record_root_prefix()));
+        assert!(!span_key.starts_with(record_root_prefix()));
+        assert!(!record_key.starts_with(span_root_prefix()));
+        assert!(decode_record_key(&span_key).is_err());
+        assert!(decode_span_key(&record_key).is_err());
+    }
+
+    #[test]
+    fn record_key_rejects_invalid_segments() {
+        assert_eq!(
+            encode_record_key("", "default", "samples", "record-1"),
+            Err(KeyError::EmptySegment { field: "tenant_id" })
+        );
+        assert_eq!(
+            encode_record_key("tenant-1", "default", "samples/v2", "record-1"),
+            Err(KeyError::SegmentContainsDelimiter { field: "table" })
+        );
+        assert_eq!(
+            encode_record_key("tenant-1", "default", "samples", "record/1"),
+            Err(KeyError::SegmentContainsDelimiter { field: "record_id" })
+        );
+        assert_eq!(
+            decode_record_key(b"v1/r/t/tenant-1/ns/default/tb/samples"),
+            Err(KeyError::InvalidFormat)
         );
     }
 }

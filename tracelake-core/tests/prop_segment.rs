@@ -4,7 +4,8 @@
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use tracelake_core::{
-    SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest, SegmentStats, segment_id,
+    FieldRange, RecordStats, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest,
+    SegmentStats, segment_id,
 };
 
 /// Fixed epoch (mid-2026); deltas stay inside RFC3339-safe nanosecond range.
@@ -113,6 +114,35 @@ fn entry_id() -> impl Strategy<Value = String> {
     ]
 }
 
+fn field_range() -> impl Strategy<Value = FieldRange> {
+    (
+        prop::option::of(any::<i64>()),
+        prop::option::of(0.0f64..1_000.0),
+        prop::option::of(small_string()),
+        prop::option::of(prop::collection::vec(small_string(), 0..=4)),
+    )
+        .prop_map(|(i64_min, f64_max, string_min, distinct)| FieldRange {
+            i64_min,
+            f64_max,
+            string_min,
+            distinct,
+            ..FieldRange::default()
+        })
+}
+
+fn record_stats() -> impl Strategy<Value = RecordStats> {
+    (
+        any::<u64>(),
+        0u64..=100_000,
+        prop::collection::vec((small_string(), field_range()), 0..=3),
+    )
+        .prop_map(|(schema_fingerprint, record_count, fields)| RecordStats {
+            schema_fingerprint,
+            record_count,
+            fields: fields.into_iter().collect(),
+        })
+}
+
 fn entry() -> impl Strategy<Value = SegmentEntry> {
     (
         entry_id(),
@@ -120,14 +150,16 @@ fn entry() -> impl Strategy<Value = SegmentEntry> {
         0u64..=100_000,
         prop::collection::vec(file(), 0..=3),
         stats(),
+        prop::option::of(record_stats()),
     )
         .prop_map(
-            |(segment_id, trace_count, span_count, files, stats)| SegmentEntry {
+            |(segment_id, trace_count, span_count, files, stats, record_stats)| SegmentEntry {
                 segment_id,
                 trace_count,
                 span_count,
                 files,
                 stats,
+                record_stats,
             },
         )
 }
@@ -137,13 +169,15 @@ fn manifest() -> impl Strategy<Value = SegmentManifest> {
         1u32..=3,
         small_string(),
         small_string(),
+        prop::option::of(small_string()),
         prop::collection::vec(entry(), 0..=4),
     )
         .prop_map(
-            |(version, tenant_id, namespace, segments)| SegmentManifest {
+            |(version, tenant_id, namespace, table, segments)| SegmentManifest {
                 version,
                 tenant_id,
                 namespace,
+                table,
                 segments,
             },
         )
@@ -183,6 +217,7 @@ proptest! {
                 span_count: 1,
                 files: Vec::new(),
                 stats: SegmentStats::default(),
+                record_stats: None,
             });
         }
         prop_assert_eq!(m.next_segment_number(), expected);
@@ -199,6 +234,7 @@ proptest! {
                 span_count: 1,
                 files: Vec::new(),
                 stats: SegmentStats::default(),
+                record_stats: None,
             });
         }
         prop_assert_eq!(m.next_segment_number(), expected);

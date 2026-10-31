@@ -1,17 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-/// Inventory of every compacted segment for one (tenant, namespace).
-///
-/// The manifest is the atomic publish point for compaction: segment files are
-/// written first, then a single manifest PUT makes them visible to readers.
-/// Step 4 assumes a single compactor per namespace.
+/// Different schemas must not share packs, so the manifest records the table it
+/// belongs to; trace manifests leave it unset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SegmentManifest {
     /// Manifest format version.
     pub version: u32,
     pub tenant_id: String,
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
     /// Every published segment, oldest first.
     pub segments: Vec<SegmentEntry>,
 }
@@ -27,6 +27,9 @@ pub struct SegmentEntry {
     pub files: Vec<SegmentFile>,
     /// Embedded stats so the planner can prune without extra reads.
     pub stats: SegmentStats,
+    /// Set for record segments, absent for trace segments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_stats: Option<RecordStats>,
 }
 
 /// One file inside a segment.
@@ -45,6 +48,7 @@ pub struct SegmentFile {
 #[serde(rename_all = "snake_case")]
 pub enum SegmentFileKind {
     TracePack,
+    RecordPack,
     Bloom,
     Stats,
 }
@@ -54,6 +58,7 @@ impl SegmentFileKind {
     pub fn extension(self) -> &'static str {
         match self {
             SegmentFileKind::TracePack => "tracepack",
+            SegmentFileKind::RecordPack => "recordpack",
             SegmentFileKind::Bloom => "bloom",
             SegmentFileKind::Stats => "stats",
         }
@@ -88,6 +93,42 @@ pub struct SegmentStats {
     pub score_max: Option<f64>,
 }
 
+/// Per-field bounds over one record segment, plus the schema shape the segment
+/// was written under. The query planner skips a segment when a filter cannot
+/// overlap these bounds, so it never reads the pack.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordStats {
+    pub schema_fingerprint: u64,
+    pub record_count: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, FieldRange>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FieldRange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i64_min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i64_max: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub f64_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub f64_max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub string_min: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub string_max: Option<String>,
+    /// All distinct values, recorded only while the count stays under
+    /// [`MAX_TRACKED_DISTINCT_VALUES`]. Enables exact equality pruning on the
+    /// low-cardinality fields queries filter on (task, model, status).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct: Option<Vec<String>>,
+}
+
+/// Distinct-value lists beyond this size cost more to store than the pack read
+/// they would save.
+pub const MAX_TRACKED_DISTINCT_VALUES: usize = 64;
+
 impl SegmentManifest {
     /// Creates an empty manifest for one (tenant, namespace).
     pub fn new(tenant_id: impl Into<String>, namespace: impl Into<String>) -> Self {
@@ -95,7 +136,19 @@ impl SegmentManifest {
             version: 1,
             tenant_id: tenant_id.into(),
             namespace: namespace.into(),
+            table: None,
             segments: Vec::new(),
+        }
+    }
+
+    pub fn new_table(
+        tenant_id: impl Into<String>,
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Self {
+        Self {
+            table: Some(table.into()),
+            ..Self::new(tenant_id, namespace)
         }
     }
 
@@ -154,6 +207,7 @@ mod tests {
                 score_min: None,
                 score_max: None,
             },
+            record_stats: None,
         }
     }
 
@@ -168,6 +222,47 @@ mod tests {
             serde_json::from_str(&encoded).expect("manifest should decode");
 
         assert_eq!(decoded, manifest);
+        assert_eq!(decoded.table, None);
+    }
+
+    #[test]
+    fn table_manifest_round_trips_with_record_stats() {
+        let mut entry = example_entry("segment-000001");
+        entry.record_stats = Some(RecordStats {
+            schema_fingerprint: 0xabc,
+            record_count: 2,
+            fields: BTreeMap::from([(
+                "score".to_string(),
+                FieldRange {
+                    f64_min: Some(0.25),
+                    f64_max: Some(0.75),
+                    distinct: Some(vec!["gsm8k".to_string()]),
+                    ..FieldRange::default()
+                },
+            )]),
+        });
+
+        let mut manifest = SegmentManifest::new_table("tenant-1", "default", "eval_samples");
+        manifest.segments.push(entry);
+
+        let encoded = serde_json::to_string(&manifest).expect("manifest should encode");
+        let decoded: SegmentManifest =
+            serde_json::from_str(&encoded).expect("manifest should decode");
+
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.table.as_deref(), Some("eval_samples"));
+    }
+
+    #[test]
+    fn empty_record_stats_fields_are_omitted() {
+        let stats = RecordStats {
+            record_count: 1,
+            ..RecordStats::default()
+        };
+
+        let value = serde_json::to_value(stats).expect("stats should encode");
+        assert!(value.get("fields").is_none());
+        assert!(value.get("schema_fingerprint").is_some());
     }
 
     #[test]
