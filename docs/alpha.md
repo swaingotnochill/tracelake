@@ -25,6 +25,7 @@ is explicitly out of scope.
 | Select an object store | `TRACELAKE_STORE=local`, `s3`, or `gcs` | `store.rs` tests |
 | Change a field's type | register the new type | migration e2e test |
 | Cache hot text index | automatic | index-reuse test |
+| S3-compatible storage | `TRACELAKE_STORE=s3` with an endpoint | Smoke run against Moto: ingest, compact, restart fetch |
 | Durable storage | `TRACELAKE_DATA_DIR`, or an S3 or GCS bucket | restart test, store selection tests |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 
@@ -41,7 +42,7 @@ is explicitly out of scope.
 | Tenant isolation at the key and path level | Yes | Isolation tests |
 | A single process can restart without data loss | Yes | Restart test |
 | Dependency advisories are checked in CI | Yes | `audit` workflow on changes and weekly |
-| Object storage is selectable at runtime | Yes | `store.rs` selection and configuration tests. S3 and GCS are compile-tested and configuration-tested; no live bucket was exercised here |
+| Object storage is selectable at runtime | Yes | Local round trip and store selection tests. S3 was exercised end to end against an S3-compatible emulator: ingest, compact, six segment objects, and a trace fetch after a server restart. GCS remains configuration-tested only |
 | Request size is bounded | Yes | 32 MiB body limit |
 | A read cannot run forever | Yes | 30 s query timeout, 504 on expiry |
 | One tenant cannot starve others | Yes | 16 concurrent reads per tenant, 429 above it |
@@ -53,9 +54,9 @@ is explicitly out of scope.
 
 ## Required before the alpha tag
 
-1. A live S3 or GCS run in CI or a staging environment. The store selection is
-   tested and the code paths compile, but no bucket credentials are available
-   here.
+1. A live GCS run. S3 was smoke-tested against an S3-compatible emulator with
+   path-style addressing. GCS needs a bucket and `GOOGLE_*` credentials, which
+   are not available here.
 
 ## Operational notes
 
@@ -64,6 +65,8 @@ is explicitly out of scope.
   tenant name. A request over the cap gets 429. A request past the timeout gets
   504. The timeout wraps the database call; the permit is released when the call
   returns, times out, or is cancelled.
+- S3 requests use path-style addressing when `TRACELAKE_ENDPOINT` is set, which
+  is what MinIO, Moto, and similar servers expect.
 - `TRACELAKE_STORE` selects `local` (default), `s3`, or `gcs`.
   `TRACELAKE_BUCKET` names the bucket. `TRACELAKE_REGION` and
   `TRACELAKE_ENDPOINT` configure S3 or an S3-compatible server such as MinIO.

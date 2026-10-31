@@ -146,7 +146,8 @@ impl StoreSettings {
                 if let Some(endpoint) = &self.endpoint {
                     builder = builder
                         .with_endpoint(endpoint)
-                        .with_allow_http(endpoint.starts_with("http://"));
+                        .with_allow_http(endpoint.starts_with("http://"))
+                        .with_virtual_hosted_style_request(false);
                 }
 
                 Ok(Arc::new(builder.build()?))
