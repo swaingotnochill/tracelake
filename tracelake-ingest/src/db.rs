@@ -1,10 +1,22 @@
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
-use tracelake_core::{Span, encode_span_storage_key, namespace_prefix, trace_prefix};
+use tracelake_core::{
+    Record, Span, TableSchema, decode_record_key, encode_record_key, encode_span_storage_key,
+    namespace_prefix, record_prefix, span_root_prefix, trace_prefix,
+};
 
 use std::sync::Arc;
 
 use crate::ingest::IngestError;
+
+/// One hot record plus the table coordinates decoded from its key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRecord {
+    pub tenant_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub record: Record,
+}
 
 /// Thin SlateDB wrapper for writing and reading hot trace spans.
 /// Cloning shares the same underlying SlateDB handle.
@@ -71,7 +83,85 @@ impl TraceLakeDb {
     /// Scans every span in the hot store in key order: tenant, namespace,
     /// trace_id, then start time, then span_id.
     pub async fn scan_all_spans(&self) -> Result<Vec<Span>, IngestError> {
-        Self::scan_spans(&self.db, Vec::new()).await
+        Self::scan_spans(&self.db, span_root_prefix().to_vec()).await
+    }
+
+    /// Validates each record against `schema` and writes them in one batch.
+    pub async fn put_records(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        schema: &TableSchema,
+        records: &[Record],
+    ) -> Result<(), IngestError> {
+        let mut batch = WriteBatch::new();
+
+        for record in records {
+            schema.validate(record)?;
+
+            let record_id = schema.record_id(record)?;
+            let key = encode_record_key(tenant_id, namespace, &schema.table, &record_id)?;
+            batch.put(key, serde_json::to_vec(record)?);
+        }
+
+        self.db.write(batch).await?;
+        Ok(())
+    }
+
+    /// Reads one record by primary key.
+    pub async fn get_record(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        schema: &TableSchema,
+        record_id: &str,
+    ) -> Result<Option<Record>, IngestError> {
+        let key = encode_record_key(tenant_id, namespace, &schema.table, record_id)?;
+
+        match self.db.get(key).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads every record of one table in key order.
+    pub async fn get_table_records(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Vec<Record>, IngestError> {
+        let prefix = record_prefix(tenant_id, namespace, table)?;
+        let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut records = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            records.push(serde_json::from_slice(&kv.value)?);
+        }
+
+        Ok(records)
+    }
+
+    /// Reads every record in the hot store with the tenant, namespace, and
+    /// table it was written under.
+    pub async fn scan_all_records(&self) -> Result<Vec<StoredRecord>, IngestError> {
+        let mut iter = self
+            .db
+            .scan_prefix(tracelake_core::record_root_prefix().to_vec())
+            .await?;
+        let mut records = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            let key = decode_record_key(&kv.key)?;
+            records.push(StoredRecord {
+                tenant_id: key.tenant_id,
+                namespace: key.namespace,
+                table: key.table,
+                record: serde_json::from_slice(&kv.value)?,
+            });
+        }
+
+        Ok(records)
     }
 
     /// Scans one key prefix and deserializes every value into a span.
@@ -322,6 +412,46 @@ mod tests {
             spans,
             vec![first, second, other_trace, other_namespace, other_tenant]
         );
+    }
+
+    #[tokio::test]
+    async fn span_and_record_scans_never_cross_into_each_other() {
+        use tracelake_core::{FieldType, Record, TableSchema};
+
+        let db = TraceLakeDb::open_in_memory("/test-span-record-isolation")
+            .await
+            .expect("db should open");
+
+        let span = get_example_span();
+        let schema = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .field("body", FieldType::String)
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let record = Record::new()
+            .set("id", serde_json::json!("record-1"))
+            .set("body", serde_json::json!("hello"));
+
+        db.put_spans(std::slice::from_ref(&span))
+            .await
+            .expect("span should write");
+        db.put_records(
+            "tenantid-1",
+            "default",
+            &schema,
+            std::slice::from_ref(&record),
+        )
+        .await
+        .expect("record should write");
+
+        let spans = db.scan_all_spans().await.expect("spans should scan");
+        assert_eq!(spans, vec![span]);
+
+        let records = db.scan_all_records().await.expect("records should scan");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].table, "notes");
+        assert_eq!(records[0].record, record);
     }
 
     #[tokio::test]
