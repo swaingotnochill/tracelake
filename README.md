@@ -179,6 +179,19 @@ A runnable example, a real inspect-ai eval against GLM-4.7 plus the database que
 its log, is in [examples/inspect-ai-evals](examples/inspect-ai-evals). Run
 `examples/inspect-ai-evals/run.sh` to regenerate the log and the query output.
 
+## Documentation
+
+A static documentation site lives in `site/`. Open `site/index.html`, or serve it:
+
+```bash
+python3 site/build.py
+python3 -m http.server -d site 8080
+```
+
+It covers the HTTP API, custom schemas, architecture, operations, security,
+performance, verification, and research notes. The site is generated from the
+repository Markdown, so the pages and the source cannot drift.
+
 ## Architecture
 
 Database decisions, storage layout, key encoding, read/write paths, and every

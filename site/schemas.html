@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom table schemas - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a class="active" href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="custom-table-schemas">Custom table schemas</h1>
+<p>TraceLake stores spans as a fixed shape. Everything else, including eval results, is a user-defined table. A table has a typed schema, a primary key, and one schema object per tenant and namespace.</p>
+<h2 id="declare-a-schema">Declare a schema</h2>
+<pre><code class="language-rust">use tracelake_core::{FieldType, TableSchema};
+
+let schema = TableSchema::builder("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .required_field("task", FieldType::String)
+    .field("score", FieldType::F64)
+    .field("completed_at", FieldType::Timestamp)
+    .primary_key("sample_id")
+    .build()?;</code></pre>
+<p><code>build</code> checks the shape once. <code>validate_shape</code> applies the same rules when a stored schema is loaded, so a hand-edited schema object is rejected before it reaches a query.</p>
+<table><thead><tr><th>Type</th><th>JSON value</th><th>Stored as</th></tr></thead><tbody><tr><td><code>string</code></td><td>string</td><td>length-prefixed UTF-8</td></tr><tr><td><code>i64</code></td><td>integer</td><td>8 bytes, little endian</td></tr><tr><td><code>f64</code></td><td>number</td><td>8 bytes, IEEE 754 bits</td></tr><tr><td><code>bool</code></td><td>boolean</td><td>1 byte</td></tr><tr><td><code>json</code></td><td>any object, array, or scalar except null</td><td>length-prefixed JSON</td></tr><tr><td><code>timestamp</code></td><td>integer</td><td>8 bytes, nanoseconds since the Unix epoch</td></tr></tbody></table>
+<p>The primary key must be a <code>string</code> field. Its value is the record's identity: the storage key suffix and the pack directory entry both come from it. A record carries no separate id field, so the two cannot disagree.</p>
+<h2 id="register-and-evolve-the-schema">Register and evolve the schema</h2>
+<pre><code class="language-rust">let registered = put_schema(&amp;store, base_path, tenant_id, namespace, &amp;schema).await?;</code></pre>
+<p>The registry owns the version. The first registration writes version 1, an identical shape is a no-op, and a compatible change writes the next version. Segments record their own field list, so older data keeps its meaning after the schema moves on.</p>
+<table><thead><tr><th>Change</th><th>Allowed</th><th>How old records read</th></tr></thead><tbody><tr><td>Add an optional field</td><td>yes</td><td>field absent</td></tr><tr><td>Add a required field with a default</td><td>yes</td><td>the default</td></tr><tr><td>Add a required field without a default</td><td>no</td><td>earlier records cannot satisfy it</td></tr><tr><td>Drop a field</td><td>yes</td><td>field absent from the current schema</td></tr><tr><td>Change a field's type</td><td>no</td><td>the pack would decode as the wrong type</td></tr><tr><td>Change the primary key</td><td>no</td><td>record identity would change</td></tr></tbody></table>
+<p>Adding a required field needs <code>required_field_with_default</code>:</p>
+<pre><code class="language-rust">let schema = TableSchema::builder("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .required_field_with_default("grader", FieldType::String, json!("exact_match"))
+    .primary_key("sample_id")
+    .build()?;</code></pre>
+<p>A type change needs a new table name and a rewrite of the records. Type changes are refused because a pack written as <code>string</code> cannot be read as <code>i64</code> without guessing.</p>
+<h2 id="write-records">Write records</h2>
+<pre><code class="language-rust">let record = Record::new()
+    .set("sample_id", json!("17@1"))
+    .set("task", json!("gsm8k"))
+    .set("score", json!(0.75));
+
+db.put_records(tenant_id, namespace, &amp;schema, &amp;[record]).await?;</code></pre>
+<p>Validation happens at this boundary: unknown fields, missing required fields, and values of the wrong type are rejected before any write. Reads trust the schema.</p>
+<h2 id="query-records">Query records</h2>
+<pre><code class="language-rust">let query = RecordQuery {
+    filter: Some(RecordFilter::and(vec![
+        RecordFilter::eq("task", json!("gsm8k")),
+        RecordFilter::ge("score", json!(0.5)),
+    ])),
+    projection: vec!["task".into(), "score".into()],
+    limit: 100,
+};
+
+let result = reader
+    .query_records(tenant_id, namespace, "inspect_ai_samples", &amp;query)
+    .await?;</code></pre>
+<p><code>and</code>, <code>or</code>, <code>eq</code>, <code>gt</code>, <code>ge</code>, <code>lt</code>, and <code>le</code> are the operators. A comparison matches only when the field is present and not null. A filter or projection that names an undeclared field, or uses a value of the wrong type, fails before any segment is read.</p>
+<p>The result carries the projection plus the primary key, sorted by primary key, capped at <code>limit</code>. <code>scanned_segments</code> and <code>pruned_segments</code> report what the planner did.</p>
+<p><code>get_record(tenant, namespace, table, record_id)</code> is the point lookup. It checks each segment's bloom filter, then reads only the one pack that can hold the id, then prefers a hot copy if one exists.</p>
+<h2 id="storage-layout">Storage layout</h2>
+<pre><code class="language-text">SlateDB hot store
+  v1/r/t/{tenant}/ns/{namespace}/tb/{table}/r/{record_id}
+
+Object store
+  {base_path}/{tenant}/{namespace}/tables/{table}/schema.json
+  {base_path}/{tenant}/{namespace}/tables/{table}/manifest.json
+  {base_path}/{tenant}/{namespace}/tables/{table}/segment-000001.recordpack
+  {base_path}/{tenant}/{namespace}/tables/{table}/segment-000001.bloom
+  {base_path}/{tenant}/{namespace}/tables/{table}/segment-000001.stats</code></pre>
+<p>Record keys live under their own root, <code>v1/r/</code>, so a span scan and a record scan cannot read each other's values.</p>
+<p>A record pack is <code>[magic TRCREC01][field descriptors][record count u32][directory offset u64][record blocks][directory offsets][directory entries][crc32]</code>. Each descriptor holds a field name and its type. A record block is a presence bitmap over the pack's fields followed by the present values in that order. A reader maps fields by name, skips pack fields the current schema dropped, and fills declared defaults for fields the pack did not hold. A field whose stored type differs from the declared type is reported only when that field is read.</p>
+<p>The segment manifest stores per-field bounds with the type they were computed from, so a query never prunes on bounds from a different type.</p>
+<h2 id="stats-and-pruning">Stats and pruning</h2>
+<p>Compaction writes per-field bounds into the table manifest: <code>i64</code> bounds for <code>i64</code> and <code>timestamp</code> fields, <code>f64</code> bounds for <code>f64</code>, byte bounds for <code>string</code>, and up to 64 distinct values for low-cardinality string fields. A query skips a segment when its bounds prove no record can match.</p>
+<p>The pruning law is checked by property tests: if a segment is pruned, no record it held matched the filter. A field without bounds never prunes.</p>
+<h2 id="merge-order">Merge order</h2>
+<p>Segments are read oldest first, then the hot store. On a primary-key collision the hot copy wins, then the newer segment. This holds while the hot store keeps the newest copy of every record, which it does today because compaction does not delete hot data.</p>
+<h2 id="http-api">HTTP API</h2>
+<table><thead><tr><th>Method</th><th>Path</th><th>Body</th></tr></thead><tbody><tr><td><code>PUT</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/schema</code></td><td><code>TableSchema</code></td></tr><tr><td><code>GET</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/schema</code></td><td>none</td></tr><tr><td><code>POST</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/records</code></td><td><code>{ "records": [ { field: value } ] }</code></td></tr><tr><td><code>GET</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/records/{record_id}</code></td><td>none</td></tr><tr><td><code>POST</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/query</code></td><td><code>RecordQuery</code></td></tr><tr><td><code>POST</code></td><td><code>/v1/evals</code></td><td><code>{ "tenant_id", "namespace", "log" }</code></td></tr><tr><td><code>DELETE</code></td><td><code>/v1/tables/{tenant}/{ns}/{table}/records/{record_id}</code></td><td>none</td></tr><tr><td><code>POST</code></td><td><code>/v1/compact</code></td><td>none</td></tr></tbody></table>
+<p><code>POST /v1/compact</code> compacts spans and records in one call and reports both segment lists.</p>
+<h2 id="inspect-ai-eval-logs">inspect-ai eval logs</h2>
+<p><code>POST /v1/evals</code> registers the <code>inspect_ai_samples</code> schema, flattens the log, and writes one row per sample. The adapter accepts the inspect-ai JSON shape: <code>eval</code> with <code>eval_id</code>, <code>task</code>, <code>model</code>, <code>status</code>, and <code>samples</code> with <code>id</code>, <code>epoch</code>, <code>input</code>, <code>target</code>, <code>output</code>, <code>scores</code>, <code>metadata</code>, <code>model_usage</code>, <code>total_time</code>, <code>completed_at</code>, and <code>error</code>.</p>
+<table><thead><tr><th>Column</th><th>Type</th><th>Source</th></tr></thead><tbody><tr><td><code>sample_id</code></td><td>string</td><td><code>{id}@{epoch}</code></td></tr><tr><td><code>eval_id</code>, <code>task</code>, <code>model</code></td><td>string</td><td>eval header</td></tr><tr><td><code>epoch</code></td><td>i64</td><td>sample</td></tr><tr><td><code>status</code></td><td>string</td><td><code>error</code> when the sample has an error, else <code>success</code></td></tr><tr><td><code>error</code></td><td>string</td><td>sample error</td></tr><tr><td><code>scorer</code>, <code>score</code></td><td>string, f64</td><td>one scorer: the named one, or the first by name. inspect-ai pass, fail, and partial sentinels (<code>C</code>, <code>I</code>, <code>P</code>) map to 1.0, 0.0, and 0.5</td></tr><tr><td><code>total_tokens</code></td><td>i64</td><td>sum of <code>model_usage.*.total_tokens</code></td></tr><tr><td><code>total_time_s</code></td><td>f64</td><td><code>total_time</code></td></tr><tr><td><code>completed_at</code></td><td>timestamp</td><td><code>completed_at</code> as nanoseconds</td></tr><tr><td><code>trace_id</code></td><td>string</td><td><code>metadata.trace_id</code> when present</td></tr><tr><td><code>input</code>, <code>target</code>, <code>output</code></td><td>json</td><td>sample fields when present</td></tr><tr><td><code>scores</code></td><td>json</td><td>full scorer map, including answers and explanations</td></tr></tbody></table>
+<p>The storage and query layers contain no eval-specific code. The adapter emits ordinary records for an ordinary table.</p>
+<h2 id="measured-cost">Measured cost</h2>
+<p>Ten segments of 1000 records each, about 2.4 KB per record, in-memory object store, release build, on a machine with load average 14 on 8 cores. Median of 5 alternating runs:</p>
+<table><thead><tr><th>Query</th><th>Median</th><th>Range</th></tr></thead><tbody><tr><td>all 17 fields, no filter</td><td>208 ms</td><td>194 to 210 ms</td></tr><tr><td>2 fields, no filter</td><td>33 ms</td><td>31 to 33 ms</td></tr><tr><td>2 fields, filter matching every segment</td><td>32 ms</td><td>30 to 35 ms</td></tr><tr><td>2 fields, filter pruning 9 of 10 segments</td><td>2.7 ms</td><td>2.6 to 3.0 ms</td></tr><tr><td>point lookup (bloom over 10 segments, one pack read)</td><td>0.67 ms</td><td>0.60 to 1.00 ms</td></tr></tbody></table>
+<p>The limiter is JSON decoding and allocation, not object store I/O, because the store is in memory. Pruning removes whole pack reads, so it cuts both decoding and I/O. Projection skips the JSON parse of fields nobody asked for. With S3 as the store, add one GET per scanned pack and two per pruned segment (manifest and nothing else).</p>
+<h2 id="text-search">Text search</h2>
+<p>Trace search accepts <code>text_query</code>. Compaction builds a Tantivy index over every span's name, input, output, and error and stores it as the segment's <code>.text</code> file. Text search runs the index per segment, then applies the structural filters, so a trace must match both.</p>
+<p>Spans still in the hot store are not indexed yet, so a text query builds a throwaway index over the hot spans for that request. It returns the same results, and it costs time proportional to the hot buffer. Compaction moves those spans into an indexed segment.</p>
+<p>Each indexed field is clipped at 256 KB (<code>MAX_INDEXED_TEXT_BYTES</code>). Prompts larger than that remain searchable in their first 256 KB.</p>
+<h2 id="limits">Limits</h2>
+<ul><li>A field's type cannot change. Register a new table name and write the records again.</li><li>No joins, no aggregation, and no Parquet column files for records yet. Filtering is the pushdown; aggregation belongs to the columnar step.</li><li>Every segment read decodes all requested fields of every record in the pack. Selection pressure per pack is a later step.</li><li>Text search over the hot store rebuilds an index per query. It is correct, not cheap.</li></ul>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

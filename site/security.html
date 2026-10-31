@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security review - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a class="active" href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="security-review">Security review</h1>
+<p>Scope: the five library crates and the HTTP server, reviewed at the alpha milestone on 2026-10-31.</p>
+<h2 id="threat-model">Threat model</h2>
+<p>The alpha runs as one process per deployment, on a private network, with no authentication. The operator trusts the network. The attacker controls the things a client can send: span payloads, table schemas, record bodies, query filters, and eval logs. If the attacker can write to the object store, they control segment files too, so every parser must treat stored bytes as hostile.</p>
+<p>Out of scope by design, per <code>AGENTS.md</code>: user authentication, RBAC, and multi-region replication.</p>
+<h2 id="findings">Findings</h2>
+<table><thead><tr><th>Severity</th><th>Finding</th><th>Status</th></tr></thead><tbody><tr><td>High</td><td>Tenant, namespace, and table names were placed raw into object store paths. A name such as <code>..</code> could escape a file-system store root.</td><td>Fixed</td></tr><tr><td>High</td><td>The text index container names files. A crafted <code>.text</code> object could make the reader write outside its temporary directory.</td><td>Fixed</td></tr><tr><td>Medium</td><td>Request bodies had no size limit, so one request could exhaust memory.</td><td>Fixed</td></tr><tr><td>Medium</td><td>500 responses returned internal error text, including object store paths.</td><td>Fixed</td></tr><tr><td>Medium</td><td>No authentication.</td><td>Accepted for alpha, loopback bind</td></tr><tr><td>Medium</td><td>Read requests had no timeout or per-tenant cap, so one client could occupy a worker indefinitely.</td><td>Fixed: 30 s timeout, 16 concurrent reads per tenant, 429 and 504 responses</td></tr><tr><td>High</td><td>A local <code>cargo audit</code> found 17 vulnerabilities in transitive dependencies, mostly in the TLS stack and the zstd bindings.</td><td>12 fixed by <code>cargo update</code>; 5 remain and are recorded as explicit exceptions</td></tr><tr><td>Medium</td><td>No delete, tombstone, or retention path. GDPR deletion is not supported.</td><td>Open, alpha blocker for regulated data</td></tr><tr><td>Low</td><td>Field names reached Parquet column names and aggregation SQL.</td><td>Fixed by restricting the character set</td></tr></tbody></table>
+<h2 id="what-changed">What changed</h2>
+<p>Identifiers that become key segments or path components now pass <code>validate_path_segment</code>. It rejects an empty value, <code>/</code>, <code>.</code> and <code>..</code>, a backslash, any control character, and anything longer than 1024 bytes. The key encoder applies it to tenant, namespace, table, trace, span, and record ids. The schema registry applies it to tenant, namespace, and table before building a schema or manifest path. Every table endpoint validates its path parameters before touching storage, and <code>/v1/evals</code> validates the tenant and namespace in its body.</p>
+<p>The text index reader resolves every container name as a relative path built from normal components only, so <code>../escape</code> and absolute names are refused.</p>
+<p>Request bodies are capped at 32 MiB by <code>DefaultBodyLimit</code>. Server errors return <code>{"error":"internal error"}</code> and write the detail to stderr.</p>
+<p>Field names are restricted to letters, digits, <code>_</code>, <code>.</code>, and <code>-</code>, at most 128 bytes. That keeps them safe as Parquet column names and as quoted identifiers in aggregation SQL.</p>
+<h2 id="evidence">Evidence</h2>
+<ul><li><code>tracelake-core</code> unit test <code>path_segments_reject_traversal_and_control_characters</code>.</li><li><code>tracelake-compact</code> unit test <code>container_names_cannot_escape_the_extraction_directory</code>.</li><li><code>tracelake-server</code> test <code>unsafe_identifiers_are_rejected_before_touching_storage</code>.</li><li><code>tracelake-server</code> test <code>tenants_and_namespaces_are_isolated</code> covers span fetch, trace search, schema lookup, and record query across tenants.</li><li><code>cargo test --workspace</code> and <code>cargo clippy --workspace --all-targets -- -D warnings</code>.</li><li><code>.github/workflows/audit.yml</code> runs RustSec on lockfile changes and weekly.</li><li><code>.cargo/audit.toml</code> records every ignored advisory with the version that fixes it and the crate that must move first.</li><li><code>grep -rn unsafe --include='*.rs' tracelake-*</code> returns no code use of unsafe.</li></ul>
+<h2 id="dependency-audit">Dependency audit</h2>
+<p><code>cargo audit</code> at this commit found 17 vulnerabilities. <code>cargo update</code> moved 12 of them to patched versions. Five remain because they need a version that no dependency in the current graph accepts.</p>
+<table><thead><tr><th>Advisory</th><th>Crate</th><th>Fixed in</th><th>Pinned by</th><th>Exposure</th></tr></thead><tbody><tr><td>RUSTSEC-2026-0391</td><td>zstd 0.13.3</td><td>0.14.3</td><td>parquet 60, datafusion 55, foyer</td><td>Compression inside storage and analytics. TraceLake never calls zstd directly.</td></tr><tr><td>RUSTSEC-2026-0403, RUSTSEC-2026-0398</td><td>zstd-safe 7.3.0</td><td>8.2.0</td><td>follows zstd</td><td>Decompression of stored blocks.</td></tr><tr><td>RUSTSEC-2026-0195, RUSTSEC-2026-0194</td><td>quick-xml 0.38.4</td><td>0.41.0</td><td>object_store AWS feature</td><td>Parsing S3 responses from the configured endpoint. Not on the local-store path.</td></tr></tbody></table>
+<p>These are ignored in <code>.cargo/audit.toml</code> so the CI job still fails on any new advisory. Remove an ignore when its dependency graph allows the fixed version. Sixteen unmaintained or unsound warnings remain in transitive crates; the audit job reports them without failing.</p>
+<h2 id="isolation-model">Isolation model</h2>
+<p>Every key starts with <code>v1/t/{tenant}/ns/{namespace}/</code> for spans and <code>v1/r/t/{tenant}/ns/{namespace}/tb/{table}/</code> for records. Every query builds its prefix from caller-supplied tenant and namespace. Segment paths and schema paths include tenant and namespace. A query cannot read another tenant's data unless it knows that tenant's name, which is the same trust model as the rest of the alpha.</p>
+<h2 id="alpha-exposure-requirements">Alpha exposure requirements</h2>
+<ul><li>Bind to loopback or a private network. The server defaults to <code>127.0.0.1:8080</code>.</li><li>Do not store regulated data until deletes and retention exist.</li><li>Keep the data directory writable only by the service user.</li><li>Treat the object store bucket as a trusted boundary. A writer to the bucket can change segment bytes, though checksums, pack bounds, and the text container bounds make silent corruption unlikely.</li></ul>
+<h2 id="post-alpha-work">Post-alpha work</h2>
+<ul><li>Authentication and per-tenant authorization.</li><li>Request-rate limits. Timeouts and a per-tenant concurrency cap exist; a request-rate limit does not.</li><li>Delete and retention with tombstones that survive compaction.</li><li>License checking. The audit job covers advisories, not licenses.</li><li>Encryption at rest is delegated to the object store, and should be stated in deployment docs. S3 and GCS use the provider credential chain; the server does not read access keys from its own configuration.</li></ul>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

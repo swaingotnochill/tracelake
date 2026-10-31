@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TraceLake - trace database for LLM agents</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article class="hero">
+<p class="tag">alpha</p>
+<h1>TraceLake</h1>
+<p>A trace database for LLM agents. Object storage is the source of truth, SlateDB
+is the hot write buffer, and compaction writes trace packs, typed record packs,
+Parquet columns, bloom filters, and Tantivy indexes. Full traces, typed tables,
+eval logs, search, and aggregation come from one engine.</p>
+<h2>Start here</h2>
+<div class="cards">
+<a class="card" href="api.html"><strong>HTTP API</strong><span>Every endpoint, shape, limit, and status code.</span></a>
+<a class="card" href="schemas.html"><strong>Custom tables</strong><span>Typed schemas, evolution rules, records, and queries.</span></a>
+<a class="card" href="architecture.html"><strong>Architecture</strong><span>Storage layout, write and read paths, and the decisions behind them.</span></a>
+<a class="card" href="evals.html"><strong>inspect-ai evals</strong><span>A real eval run through ingest and query.</span></a>
+</div>
+<h2>Run it</h2>
+<pre><code>cargo run --release -p tracelake-server
+cargo test --workspace
+cargo run --release -p tracelake-bench
+cargo run -p tracelake-server --example inspect_ai_demo</code></pre>
+<p>The server writes to <code>./tracelake-data</code> by default. Set
+<code>TRACELAKE_STORE</code> to <code>s3</code> or <code>gcs</code> for object
+storage. There is no authentication; bind to loopback or a private network.</p>
+<h2>Where the project stands</h2>
+<p>Ingest, trace fetch, structural and full-text search, Parquet aggregation,
+typed tables with evolution, inspect-ai eval ingest, deletes, retention, read
+limits, and local or remote object storage are implemented. Open work is listed
+in <a href="alpha.html">Alpha readiness</a>. Gaps against SmithDB and Brainstore
+are in <a href="gap-analysis.html">Gap analysis</a>.</p>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FV implementation report - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a class="active" href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="formal-verification-implementation-report">Formal Verification Implementation Report</h1>
+<p>Outcome of the phased plan in formal-verification-brief.md, stages 0-4.</p>
+<h2 id="landed">Landed</h2>
+<ul><li><strong>Stage 0</strong> — rocq-of-rust assessment committed (<code>2d40fdd</code>): PASS.</li><li><strong>Stage 1</strong> — property suite committed (<code>c7cc852</code>): key codec (round-trip, ordering, prefix isolation/nesting, totality), bloom (no false negatives, membership-exact round-trip, totality, FPR bound), trace pack (exact round-trip, prefix rejection, totality), segment manifest (JSON round-trip, next-segment law, exhaustive id formatting), merge laws L1-L5, group_spans partition law, search helper laws (prune soundness, per-filter exactness, completeness). 88 workspace tests green.</li><li><strong>Bug found and fixed by the suite</strong>: serde_json's default best-effort float parsing shifted cost_usd-like values by one ULP across pack round-trips (172.0*0.001 -&gt; 0.172). Fixed with the serde_json <code>float_roundtrip</code> feature; regression test in trace_pack.rs. This was silent data corruption in the flagship read path.</li><li><strong>Stage 2</strong> — Kani harnesses: key.rs (3), bloom.rs (3), trace_pack.rs (2, including the checksum-restamped corruption totality), merge.rs (L3 last-layer-wins, L4 no-loss). search helpers stay PROPERTY tier: chrono DateTime has no symbolic construction under Kani (documented in docs/verification.md debts).</li><li><strong>Stage 3</strong> — docs/verification.md (tiers, trusted boundaries, coverage manifest, agent protocol) + AGENTS.md verification protocol section.</li><li><strong>Stage 4</strong> — CI: check (fmt/clippy/tests), kani job (paths-filtered to core/query), nightly Miri on core (non-blocking).</li></ul>
+<h2 id="kani-run-status-honest-note">Kani run status — honest note</h2>
+<p>Local <code>cargo kani</code> on this Apple Silicon machine compiles quickly but each CBMC solve takes minutes (the pack harnesses pull serde_json's serializer under the solver; unwinds up to 128). Interactive completion of the full harness set was not practical in one session; three bounded local runs reached the solving phase without finishing. <strong>The CI kani job is the authoritative gate.</strong> Expect possible per-harness unwind tuning on the first CI run; that is normal Kani adoption work and is covered by the protocol in docs/verification.md (never delete a property to make it pass).</p>
+<h2 id="remaining-gaps">Remaining gaps</h2>
+<ul><li>First green CI kani run (unwind tuning if needed).</li><li>cargo-fuzz targets for the three parsers (phase 1 of the brief).</li><li>stats_may_overlap Kani proof behind an i64-ns core extraction.</li><li>summarize_trace direct property coverage.</li></ul>
+<h2 id="session-2-making-the-proofs-actually-run-completing-stage-2">Session 2: making the proofs actually run (completing stage 2)</h2>
+<p>Kani harnesses were written but no proof had completed. Findings and fixes:</p>
+<ol><li><strong>CI workflow invalid</strong> (job-level <code>paths:</code> key, 0-second failure). Split into <code>ci.yml</code> (check + miri) and <code>kani.yml</code> (own <code>on.push.paths</code> filter).</li><li><strong>merge harness did not compile</strong> (move-after-borrow) — <code>cfg(kani)</code> code never builds under normal cargo; only a Kani run catches it.</li><li><strong>Solver walls found and removed by restructuring</strong> (each documented in docs/verification.md):</li><li><code>format!</code>/std <code>parse</code> in the key path -&gt; extracted pure <code>encode_timestamp_bytes</code> + <code>parse_timestamp_digits</code>; proofs target the codec core. PROVEN locally: digit-fold totality.</li><li>macOS OS RNG inside <code>HashMap::new()</code> (<code>RandomState</code> -&gt; CCRandomGenerateBytes, a foreign C call Kani cannot run) blocked merge proofs -&gt; <code>merge_spans</code> now uses <code>BuildHasherDefault&amp;lt;DefaultHasher&amp;gt;</code> (deterministic, identical semantics, reproducible merges).</li><li>SipHash over symbolic keys exploded the SAT instance in bloom -&gt; extracted <code>bit_position</code> (shared by insert/contains, making no-false-negative structural) and proved it in-bounds; hashing stays out of the solver.</li><li>serde_json in pack harnesses -&gt; hand-built minimal pack bytes; the corruption-totality proof covers checksum/header/directory without parsing span JSON.</li><li><strong>Locally VERIFIED (this machine)</strong>: bloom bit-position bounds, bloom decode totality, key digit-fold totality. Full-key round-trip/ordering, merge L3/L4, and pack corruption solve slowly on Apple Silicon (20+ minutes each; bit-blasted 64-bit division chains and hashbrown insert paths) — they are queued for the CI x86_64 runner, which is the authoritative gate per docs/verification.md.</li><li>All proptests stay green through every production change (88+ tests); the byte-assembly refactor of <code>encode_span_key</code> is pinned by the round-trip properties.</li></ol>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

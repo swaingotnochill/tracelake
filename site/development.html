@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Development guide - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a class="active" href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="agents-md-tracelake">AGENTS.md — TraceLake</h1>
+<h2 id="claude-md">CLAUDE.md</h2>
+<p>Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.</p>
+<p><strong>Tradeoff:</strong> These guidelines bias toward caution over speed. For trivial tasks, use judgment.</p>
+<h3 id="1-think-before-coding">1. Think Before Coding</h3>
+<p><strong>Don't assume. Don't hide confusion. Surface tradeoffs.</strong></p>
+<p>Before implementing:</p>
+<ul><li>State your assumptions explicitly. If uncertain, ask.</li><li>If multiple interpretations exist, present them — don't pick silently.</li><li>If a simpler approach exists, say so. Push back when warranted.</li><li>If something is unclear, stop. Name what's confusing. Ask.</li><li>Do not edit code unless the user explicitly asks for implementation. If the user asks to "guide", "explain", "understand", "think through", or "start with defining" something, explain the design and Rust concepts step by step without changing source files.</li></ul>
+<h3 id="2-simplicity-first">2. Simplicity First</h3>
+<p><strong>Minimum code that solves the problem. Nothing speculative.</strong></p>
+<ul><li>No features beyond what was asked.</li><li>No abstractions for single-use code.</li><li>No "flexibility" or "configurability" that wasn't requested.</li><li>No error handling for impossible scenarios.</li><li>If you write 200 lines and it could be 50, rewrite it.</li></ul>
+<p>Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.</p>
+<h3 id="3-surgical-changes">3. Surgical Changes</h3>
+<p><strong>Touch only what you must. Clean up only your own mess.</strong></p>
+<p>When editing existing code:</p>
+<ul><li>Don't "improve" adjacent code, comments, or formatting.</li><li>Don't refactor things that aren't broken.</li><li>Match existing style, even if you'd do it differently.</li><li>If you notice unrelated dead code, mention it — don't delete it.</li></ul>
+<p>When your changes create orphans:</p>
+<ul><li>Remove imports/variables/functions that YOUR changes made unused.</li><li>Don't remove pre-existing dead code unless asked.</li></ul>
+<p>The test: Every changed line should trace directly to the user's request.</p>
+<h3 id="4-goal-driven-execution">4. Goal-Driven Execution</h3>
+<p><strong>Define success criteria. Loop until verified.</strong></p>
+<p>Transform tasks into verifiable goals:</p>
+<ul><li>"Add validation" → "Write tests for invalid inputs, then make them pass"</li><li>"Fix the bug" → "Write a test that reproduces it, then make it pass"</li><li>"Refactor X" → "Ensure tests pass before and after"</li></ul>
+<p>For multi-step tasks, state a brief plan:</p>
+<pre><code>1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]</code></pre>
+<p>Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.</p>
+<hr>
+<p><strong>These guidelines are working if:</strong> fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.</p>
+<hr>
+<p>TraceLake is an open-source database purpose-built for LLM agent traces. It stores trace data in object storage (S3/GCS), uses NVMe/memory as hot cache, and beats generic databases (ClickHouse, Postgres, Elasticsearch) on trace-native workloads.</p>
+<hr>
+<h2 id="1-what-we-build-and-why">1. WHAT WE BUILD AND WHY</h2>
+<h3 id="the-problem">The Problem</h3>
+<p>LLM apps produce traces (spans). Each trace is a tree of spans — LLM calls, tool calls, retriever calls, agent decisions, eval scores. Teams store these in ClickHouse, Postgres, or Elasticsearch. None of these are built for traces:</p>
+<ul><li><strong>ClickHouse</strong>: Great at analytics. Terrible at fetching one full trace (50-500ms). No native text search. Expensive replicated disks.</li><li><strong>Postgres</strong>: Slow JSON handling (50-200ms per trace). No columnar analytics.</li><li><strong>Elasticsearch</strong>: Expensive to operate. Not trace-native. Slow on joins/hydration.</li></ul>
+<p>The UI constantly needs "give me this entire trace tree." That's a point lookup with tree reconstruction — the opposite of what a column store is good at.</p>
+<h3 id="what-tracelake-does-differently">What TraceLake Does Differently</h3>
+<p>The storage unit is a <strong>trace pack</strong> (all spans for a trace_id grouped together), not a span row. Object storage is the source of truth. Compute is stateless. NVMe is disposable cache.</p>
+<p>This means:</p>
+<ul><li>Fetching a full trace = one read, not a distributed row reconstruction.</li><li>Text search over prompts/outputs = native inverted index, not an external bolt-on.</li><li>Analytics = columnar scan over pre-built columns, not JSON extraction at query time.</li><li>Storage cost = S3 ($0.023/GB), not replicated EBS ($0.08-0.16/GB).</li></ul>
+<h3 id="benchmarks-we-must-beat">Benchmarks We Must Beat</h3>
+<p>Benchmark requirements, competitor numbers, target latencies, data shapes, and harness design live in <a href="benchmark.html">benchmark.md</a>.</p>
+<hr>
+<h2 id="2-architecture">2. ARCHITECTURE</h2>
+<p>Database architecture details live in <a href="architecture.html">architecture.md</a>.</p>
+<h2 id="3-project-structure">3. PROJECT STRUCTURE</h2>
+<pre><code>tracelake/
+  Cargo.toml                    # workspace root
+  AGENTS.md                     # project guide
+  architecture.md               # database architecture
+
+  tracelake-core/               # data types, key encoding, serialization
+    src/
+      span.rs                   # Span, Trace, Score, TokenUsage types
+      schema.rs                 # user-defined table schemas and records
+      key.rs                    # span and record key encoding/decoding for SlateDB
+      trace_pack.rs             # trace pack format (write + read)
+      record_pack.rs            # typed record pack format (write + read)
+      segment.rs                # segment manifest and per-field stats formats
+      crc.rs                    # shared checksum
+
+  tracelake-ingest/             # SlateDB integration, ingest endpoint
+    src/
+      db.rs                     # SlateDB setup, hot span and record access
+      ingest.rs                 # ingest logic (validate, batch, write to SlateDB)
+      inspect_ai.rs             # inspect-ai eval log to record adapter
+
+  tracelake-compact/            # compaction pipeline
+    src/
+      compactor.rs              # reads SlateDB SSTs, builds trace segments
+      trace_pack_writer.rs      # builds .tracepack
+      column_writer.rs          # builds .columns (Parquet)
+      text_indexer.rs           # builds .text (Tantivy)
+      bloom_writer.rs           # builds .bloom
+      stats_writer.rs           # builds .stats
+      manifest_writer.rs        # builds .manifest
+      schema_store.rs           # registers and loads table schemas
+      record_compactor.rs       # builds record segments per table
+      record_stats_writer.rs    # per-field bounds for record pruning
+      text_indexer.rs           # Tantivy index build, storage, and search
+
+  tracelake-query/              # query engine
+    src/
+      planner.rs                # query planner (routes to correct engine)
+      trace_fetch.rs            # get_trace() implementation
+      search.rs                 # search_traces() implementation
+      aggregate.rs              # aggregate() implementation (DataFusion)
+      record_query.rs           # typed record filters, projection, segment pruning
+      merge.rs                  # merge hot (SlateDB) + compacted results
+
+  tracelake-server/             # HTTP/gRPC server
+    src/
+      main.rs                   # server entry point
+      ingest_handler.rs         # ingest endpoint
+      query_handler.rs          # search + aggregate endpoints
+
+  tracelake-bench/              # benchmark suite
+    src/
+      data_gen.rs               # synthetic trace data generator
+      bench_ingest.rs           # ingest throughput benchmark
+      bench_fetch.rs            # trace fetch latency benchmark
+      bench_search.rs           # search latency benchmark
+      bench_aggregate.rs        # aggregation latency benchmark
+      bench_hydrate.rs          # hydration benchmark</code></pre>
+<hr>
+<h2 id="4-step-by-step-build-order">4. STEP-BY-STEP BUILD ORDER</h2>
+<p>Each step produces working, testable code. No step depends on a future step.</p>
+<h3 id="step-1-tracelake-core-data-types-and-key-encoding">Step 1: tracelake-core — Data Types and Key Encoding</h3>
+<p>Build the Span struct, key encoding/decoding, and unit tests. No external dependencies beyond serde. This is pure data transformation.</p>
+<p>Verify: key encode → key decode round-trips correctly for all span shapes. Benchmark: key encoding speed (target: &gt;10M keys/s per thread).</p>
+<h3 id="step-2-tracelake-ingest-slatedb-integration">Step 2: tracelake-ingest — SlateDB Integration</h3>
+<p>Open a SlateDB instance with InMemory object store. Write spans using the key encoding from Step 1. Read them back using scan_prefix().</p>
+<p>Verify: write 100K spans, read them back grouped by trace_id. Benchmark: SlateDB put() throughput with our key pattern.</p>
+<h4 id="step-2-learning-and-debugging-guide">Step 2 Learning and Debugging Guide</h4>
+<p>The purpose of <code>tracelake-ingest</code> is to make hot trace writes real before any compaction or query engine exists. It should prove that a <code>Span</code> from <code>tracelake-core</code> can be encoded into the one canonical SlateDB key, written, and read back by trace prefix in deterministic order.</p>
+<p>Build this crate in small, testable moves:</p>
+<ol><li>Add one public write method, <code>put_span(&amp;amp;self, span: &amp;amp;Span)</code>. Verify: one span writes without warnings and can be fetched by its exact key.</li><li>Add one read method, <code>get_trace_spans(...)</code>. Verify: scan the <code>trace_prefix(...)</code> and deserialize the returned values.</li><li>Add one batch helper, <code>put_spans(&amp;amp;self, spans: &amp;amp;[Span])</code>. Verify: multiple spans from one trace read back sorted by start time.</li><li>Add isolation tests. Verify: a trace prefix scan does not return spans from another trace, namespace, or tenant.</li><li>Add the 100K span check only after the small tests pass. Verify: spans are grouped by trace_id and the count is exact.</li></ol>
+<p>While learning Rust, prefer explicit, idiomatic basics over clever code:</p>
+<ul><li>Use borrowed inputs for read-only APIs: <code>&amp;amp;Span</code>, <code>&amp;amp;[Span]</code>, and <code>&amp;amp;str</code>.</li><li>Return <code>Result&amp;lt;T, IngestError&amp;gt;</code> from every fallible public ingest function.</li><li>Use <code>?</code> to propagate errors. Do not use <code>unwrap()</code> outside tests.</li><li>Use <code>thiserror</code> for error enums and preserve the source error with <code>#[from]</code>.</li><li>Keep async only around SlateDB I/O. Serialization and key encoding are normal synchronous work.</li><li>Keep functions short. If a function handles key building, serialization, database I/O, and deserialization, split helper functions.</li><li>Add doc comments to every public struct and public function as the API appears.</li></ul>
+<p>Debug correctness before performance:</p>
+<ul><li>If writes fail, inspect the generated key first. Most ingest bugs will be bad tenant/namespace/trace/span identifiers or timestamp conversion.</li><li>If reads return nothing, compare the exact span key with the trace prefix. The span key must start with <code>trace_prefix(tenant_id, namespace, trace_id)</code>.</li><li>If ordering is wrong, remember SlateDB sorts bytes lexicographically. The timestamp segment must stay zero-padded to the width defined in <code>tracelake-core/src/key.rs</code>.</li><li>If deserialization fails, print or inspect the stored value bytes in the test and confirm the value is the serialized <code>Span</code>, not the key.</li><li>If only root tests run, use <code>cargo test --workspace</code>. Plain <code>cargo test</code> at the repository root may not exercise every workspace crate.</li></ul>
+<p>Profile only after behavior is correct:</p>
+<ul><li>First use unit and integration tests to prove exact counts and grouping.</li><li>Then add a benchmark or ignored test that writes 100K spans with realistic tenant, namespace, trace_id, span_id, timestamps, and payload sizes.</li><li>Measure separate timings for key encoding, serialization, SlateDB <code>put()</code>, and <code>scan_prefix()</code> readback. A single total duration hides the bottleneck.</li><li>Do not claim ingest throughput until the benchmark discloses dataset shape, payload size, durability settings, and whether the object store is in-memory or S3-compatible.</li></ul>
+<h3 id="step-3-tracelake-compact-trace-pack-writer">Step 3: tracelake-compact — Trace Pack Writer</h3>
+<p>Read spans from SlateDB (sorted by key, which means grouped by trace_id). Write them into a trace pack binary format. Read the trace pack back and verify correctness.</p>
+<p>Verify: write 10K spans (100 traces × 100 spans), read each trace back. Benchmark: trace pack write speed, trace pack read speed by trace_id.</p>
+<h3 id="step-4-tracelake-compact-full-segment-builder">Step 4: tracelake-compact — Full Segment Builder</h3>
+<p>Extend Step 3 to also write .bloom, .stats, .manifest. (Tantivy text index and Parquet columns come in later steps.)</p>
+<p>Verify: build a segment, read it back, verify bloom filter catches non-existent traces. Benchmark: compaction throughput (spans/second).</p>
+<h3 id="step-5-tracelake-query-trace-fetch">Step 5: tracelake-query — Trace Fetch</h3>
+<p>Implement get_trace(): check SlateDB hot buffer first, then compacted segments. This is the merge path described in <a href="architecture.html">architecture.md</a>.</p>
+<p>Verify: write a trace, fetch it before compaction (hot), fetch it after compaction (cold). Benchmark: trace fetch latency (warm and cold).</p>
+<h3 id="step-6-tracelake-query-search">Step 6: tracelake-query — Search</h3>
+<p>Implement search_traces() with status/model/time filters. Use bloom filters and stats for pruning.</p>
+<p>Verify: write 1000 traces with various statuses, search for failed traces, verify correct. Benchmark: search latency with 10K/100K/1M traces in segments.</p>
+<h3 id="step-7-tracelake-compact-tantivy-text-index">Step 7: tracelake-compact — Tantivy Text Index</h3>
+<p>Build Tantivy index during compaction. Store on object store. Query Tantivy index during search.</p>
+<p>Verify: write traces with "hallucination" in output, text search finds them. Benchmark: text search latency, index build time.</p>
+<h3 id="step-8-tracelake-query-aggregation-via-datafusion">Step 8: tracelake-query — Aggregation via DataFusion</h3>
+<p>Write .columns (Parquet) during compaction. Register custom TableProvider in DataFusion. Implement aggregate().</p>
+<p>Verify: write traces with various latencies, compute p95 by model, verify correct. Benchmark: aggregation latency over 1M/10M/100M spans.</p>
+<h3 id="step-9-tracelake-server-http-api">Step 9: tracelake-server — HTTP API</h3>
+<p>Wire up ingest, search, aggregate behind HTTP endpoints. Run end-to-end: ingest → compact → query.</p>
+<h3 id="step-10-tracelake-bench-full-benchmark-suite">Step 10: tracelake-bench — Full Benchmark Suite</h3>
+<p><code>tracelake-bench</code> runs ingest, flush, hot and cold fetch, structural search, and text search phases over one synthetic corpus, printing dataset shape and correctness counts with each timing. Run it with <code>cargo run --release -p tracelake-bench</code>. Do not claim performance wins until the benchmark harness proves correctness, discloses dataset shape, and separates warm-cache, cold-cache, ingest, search, hydration, and freshness results.</p>
+<h3 id="step-8-status">Step 8 status</h3>
+<p><code>.columns</code> Parquet files are written for every span and record segment. <code>aggregate_spans</code> and <code>aggregate_records</code> register those files in DataFusion and answer grouped count, sum, avg, min, max, and p50/p95/p99 queries. Filters are not pushed into aggregation yet.</p>
+<h3 id="step-11-custom-table-schemas-and-eval-storage">Step 11: Custom Table Schemas and Eval Storage</h3>
+<p>Users define typed tables. Each table registers one schema per (tenant, namespace), validated on construction and again on load. A compatible change becomes the next schema version; record packs carry their own field descriptors, so older segments keep decoding. Records are validated at the ingest boundary, stored in the hot store under a record key family, compacted into typed record packs with per-field stats, and queried with typed filters, projection, and segment pruning. Eval runs from inspect-ai are stored as ordinary rows of the <code>inspect_ai_samples</code> table.</p>
+<p>This step also implements Step 7: compaction builds a Tantivy index over span name, input, output, and error, and <code>search_traces</code> accepts <code>text_query</code>.</p>
+<p>Reference: <a href="schemas.html">docs/schemas.md</a>. Decision trail: <a href="adr.html">docs/research/adr-custom-schemas.md</a>.</p>
+<p>Verify: register a schema, write records, query hot, compact, query cold with a filter that prunes segments, and ingest an inspect-ai log over HTTP.</p>
+<hr>
+<h2 id="4-1-implementation-plan-assessment">4.1 IMPLEMENTATION PLAN ASSESSMENT</h2>
+<p>The initial plan is directionally good:</p>
+<ul><li>Object storage as source of truth matches SmithDB, Brainstore, and turbopuffer-style architecture.</li><li>Trace-local row storage is the right core bet for trace tree loads and hydration.</li><li>Separate columnar, text, bloom, stats, and manifest files match the actual workload mix.</li><li>Hot + compacted merge is required; both SmithDB and Brainstore optimize for realtime reads while background compaction catches up.</li><li>Rust, DataFusion, Tantivy, Parquet/Arrow, and stateless services are a reasonable stack.</li></ul>
+<p>Changes to make before implementation:</p>
+<ul><li>Treat SmithDB/Brainstore as the first-class benchmark competitors, not only generic ClickHouse/Langfuse/Elasticsearch systems.</li><li>Validate trace fetch and hydration on realistic large payloads early. A tiny synthetic span benchmark can hide the cost of deserializing prompts, outputs, and tool payloads.</li><li>Add thread filtering and tree-aware filters to the benchmark suite. SmithDB explicitly reports threads filtering, and agent observability workloads increasingly need it.</li><li>Measure read-after-write freshness as a benchmark. The design is incomplete if recent WAL/hot writes are fast to ingest but slow or inconsistent to query.</li><li>Do not make the MVP depend on reaching 1B spans first. Prove correctness and latency at 3.9M production-shaped traces, then scale to 50M traces / 1B spans.</li><li>Revisit the storage format choice after Step 3. FlatBuffers may be good for fixed fields, but huge semi-structured JSON payloads need a streaming/truncated preview path so UI lists do not fully deserialize multi-MB objects.</li></ul>
+<hr>
+<h2 id="5-coding-rules">5. CODING RULES</h2>
+<h3 id="dry">DRY</h3>
+<ul><li>One definition of the span schema. Used for ingest, storage, and query.</li><li>One key encoding function. Used for write and read.</li><li>One segment manifest format. Used by compactor and query planner.</li><li>If you write the same logic twice, extract it into a shared function immediately.</li></ul>
+<h3 id="yagni">YAGNI</h3>
+<ul><li>Do NOT build: user authentication, RBAC, multi-region replication, custom retention policies, vector search, SQL parser, admin UI, alerting integrations, export to CSV/JSON, GraphQL API, WebSocket streams.</li><li>Do NOT over-engineer: The query planner is a match statement, not an optimizer with cost models. The segment format is a flat binary file, not a self-describing container with version negotiation. The API is three endpoints, not a query language.</li><li>Build what's needed for Steps 1-10. Nothing more.</li><li>When in doubt, leave it out. We can always add it later.</li></ul>
+<h3 id="clean-code">Clean Code</h3>
+<ul><li>Functions under 50 lines. If longer, split.</li><li>No magic numbers. Named constants for block sizes, thresholds, limits.</li><li>No implicit behavior. If a function can fail, return Result. If a parameter is required, don't make it Option.</li><li>Errors carry context. Use <code>thiserror</code>. Include what failed and why.</li><li>Tests for every public function. Tests for every edge case (empty traces, single-span traces, missing fields, duplicate span_ids).</li><li>No <code>unwrap()</code> in non-test code. Use <code>?</code> or <code>context()</code>.</li><li>Every <code>pub fn</code> has a doc comment. Every <code>pub struct</code> has a doc comment.</li><li>Async only where needed (I/O). CPU-bound work is synchronous.</li></ul>
+<hr>
+<h2 id="6-what-we-do-not-build">6. WHAT WE DO NOT BUILD</h2>
+<p>To be explicit about scope boundaries:</p>
+<ul><li>We do NOT build a clickhouse replacement. We build a trace database.</li><li>We do NOT build a vector database. If semantic search is needed, add it later.</li><li>We do NOT build a log storage system. We store agent traces, not generic logs.</li><li>We do NOT build a real-time streaming system. CDC is a future optimization.</li><li>We do NOT build a schema registry. Attributes are opaque JSON.</li><li>We do NOT build SQL. The API is programmatic (search + aggregate structs).</li><li>We do NOT build multi-region replication. Object storage handles durability.</li><li>We do NOT build automatic scaling. That's a deployment concern, not a database concern.</li></ul>
+<hr>
+<h2 id="7-open-questions-answer-during-profiling">7. OPEN QUESTIONS — ANSWER DURING PROFILING</h2>
+<p>These are NOT design decisions to make now. They are measurements to take during Steps 2 and 3. The answer determines whether we adjust, not whether we build.</p>
+<ol><li><strong>SlateDB throughput with our key size</strong>: Our keys are ~200 bytes (long prefixes). Does this hurt SlateDB's bloom filter efficiency or SSTable size? → Measure in Step 2.</li></ol>
+<ol><li><strong>Trace pack optimal size</strong>: How large should each trace pack be? Too small = too many S3 objects. Too large = slow cold reads. → Measure in Step 3. Initial guess: 64-256 MB.</li></ol>
+<ol><li><strong>Tantivy index size on S3</strong>: Tantivy indexes can be large relative to data. Does the text index fit in cache alongside trace packs and bloom filters? → Measure in Step 7.</li></ol>
+<ol><li><strong>Hot/cold merge latency</strong>: How expensive is merging SlateDB hot buffer results with compacted segment results? Is it fast enough for real-time queries? → Measure in Step 5.</li></ol>
+<ol><li><strong>Compaction keeping up with ingest</strong>: Can one compactor node keep up with 500K spans/s ingest? How many compactors do we need? → Measure in Step 4 after generating load in Step 2.</li></ol>
+<hr>
+<h2 id="8-profiling-debugging-and-dev-dependencies">8. PROFILING, DEBUGGING, AND DEV DEPENDENCIES</h2>
+<h3 id="9-1-profiling-tools">9.1 Profiling Tools</h3>
+<table><thead><tr><th>Tool</th><th>What It Profiles</th><th>Install</th><th>How to Use</th></tr></thead><tbody><tr><td><code>cargo-flamegraph</code></td><td>CPU time, on-CPU flame graphs</td><td><code>cargo install flamegraph</code></td><td><code>cargo flamegraph -o flame.svg --bin tracelake-server -- --profile profiling</code></td></tr><tr><td><code>samply</code></td><td>CPU + wall-clock sampling profiler (tokio-aware, modern replacement for pprof)</td><td><code>cargo install samply</code></td><td><code>samply record -- ./target/profiling/tracelake-server</code></td></tr><tr><td><code>tracy</code></td><td>Frame-level CPU + GPU + memory profiling, real-time viewer</td><td><code>cargo install tracy</code></td><td>Build with <code>tracy</code> feature, connect Tracy client</td></tr><tr><td><code>tokio-console</code></td><td>Async task state, wakers, pending I/O</td><td><code>cargo install tokio-console</code></td><td>Set <code>RUSTFLAGS="--cfg tokio_unstable"</code> then <code>tokio-console</code></td></tr><tr><td><code>tracing</code></td><td>Structured event logging (already a dependency)</td><td>In-tree</td><td>Use <code>tracing::instrument</code> on hot paths. Emit span timing for ingest/compaction/query</td></tr><tr><td><code>criterion</code></td><td>Microbenchmarking with statistical analysis</td><td>Dev dependency</td><td><code>cargo bench -p tracelake-bench</code> — HTML reports + flamegraph support</td></tr></tbody></table>
+<h3 id="9-2-cargo-profiling-profile">9.2 Cargo Profiling Profile</h3>
+<p>DataFusion's approach: a dedicated Cargo profile that inherits release optimizations but keeps debug info for external profilers. We do the same.</p>
+<pre><code class="language-toml"># In workspace Cargo.toml
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false   # keep debug info for flamegraphs/samply</code></pre>
+<p>Build with: <code>cargo build --profile profiling --bin tracelake-server</code></p>
+<h3 id="9-3-allocator">9.3 Allocator</h3>
+<p>DataFusion defaults to <code>mimalloc</code> in benchmarks for better allocation performance. We do the same for tracelake-bench.</p>
+<pre><code class="language-toml"># In tracelake-bench/Cargo.toml
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+mimalloc = { version = "0.1", optional = true }</code></pre>
+<p>In bench binary:</p>
+<pre><code class="language-rust">#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;</code></pre>
+<h3 id="9-2-debugging-tools">9.2 Debugging Tools</h3>
+<table><thead><tr><th>Tool</th><th>What It Does</th><th>When to Use</th></tr></thead><tbody><tr><td><code>cargo-expand</code></td><td>Shows macro expansion</td><td>Debugging derive macros, async_trait expansion</td></tr><tr><td><code>cargo-rr</code></td><td>Record/replay debugging</td><td>Reproducing flaky race conditions in compaction or merge</td></tr><tr><td><code>cargo-nextest</code></td><td>Parallel test runner, better output</td><td>Faster CI, better failure output than <code>cargo test</code></td></tr><tr><td><code>insta</code></td><td>Snapshot testing</td><td>Comparing trace pack binary output, segment manifest JSON</td></tr><tr><td><code>miri</code></td><td>Undefined behavior detection</td><td>If we add unsafe code (should be rare — only in trace pack serialization)</td></tr></tbody></table>
+<h3 id="9-3-object-store-testing">9.3 Object Store Testing</h3>
+<p>Local development needs an S3-compatible store. No real S3 credentials in dev.</p>
+<table><thead><tr><th>Tool</th><th>Purpose</th><th>How to Run</th></tr></thead><tbody><tr><td>MinIO</td><td>S3-compatible local object store</td><td><code>docker run -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ":9001"</code></td></tr><tr><td><code>object_store</code> InMemory</td><td>In-memory object store for unit tests</td><td><code>Arc::new(InMemory::new())</code> — no external dependency</td></tr></tbody></table>
+<h3 id="9-4-linting-and-formatting">9.4 Linting and Formatting</h3>
+<table><thead><tr><th>Tool</th><th>Purpose</th><th>Config</th></tr></thead><tbody><tr><td><code>rustfmt</code></td><td>Code formatting</td><td><code>rustfmt.toml</code> at workspace root (match SlateDB style)</td></tr><tr><td><code>clippy</code></td><td>Linting</td><td><code>clippy.toml</code> at workspace root</td></tr><tr><td><code>cargo-deny</code></td><td>License and dependency audit</td><td><code>deny.toml</code> at workspace root</td></tr></tbody></table>
+<h3 id="9-5-ci-requirements">9.5 CI Requirements</h3>
+<p>Every PR must pass:</p>
+<ol><li><code>cargo fmt --check</code></li><li><code>cargo clippy -- -D warnings</code></li><li><code>cargo nextest run</code> (all tests)</li><li><code>cargo audit</code> (RustSec advisories; the <code>audit</code> workflow runs it)</li></ol>
+<h3 id="9-6-how-to-profile-each-build-step">9.6 How to Profile Each Build Step</h3>
+<table><thead><tr><th>Step</th><th>What to Profile</th><th>Tool</th></tr></thead><tbody><tr><td>Step 2 (SlateDB ingest)</td><td>Put throughput, WAL flush latency, MemTable growth</td><td><code>tokio-console</code> + <code>tracing</code> span timing</td></tr><tr><td>Step 3 (Trace pack)</td><td>Serialization speed, deserialization speed, allocation count</td><td><code>cargo-flamegraph</code> on bench, <code>samply</code> for allocation</td></tr><tr><td>Step 4 (Segment builder)</td><td>Compaction throughput, I/O bytes per span, S3 PUT/GET count</td><td><code>tracing</code> event counters + <code>samply</code></td></tr><tr><td>Step 5 (Trace fetch)</td><td>Warm latency, cold latency, cache hit rate, bloom filter false positive rate</td><td><code>tracing</code> span timing, <code>cargo-flamegraph</code></td></tr><tr><td>Step 7 (Tantivy)</td><td>Index build time, index size, query latency</td><td><code>tracing</code> span timing</td></tr><tr><td>Step 8 (DataFusion)</td><td>Aggregation latency, Parquet scan throughput</td><td><code>tracing</code> span timing, DataFusion built-in metrics</td></tr></tbody></table>
+<hr>
+<h2 id="9-external-dependencies">9. EXTERNAL DEPENDENCIES</h2>
+<h3 id="runtime-dependencies">Runtime Dependencies</h3>
+<table><thead><tr><th>Crate</th><th>Purpose</th><th>Why This One</th></tr></thead><tbody><tr><td><code>slatedb</code></td><td>WAL, SSTables, compaction, caching, bloom</td><td>Proven object-storage-first LSM, embeddable</td></tr><tr><td><code>tantivy</code></td><td>Full-text search</td><td>Rust-native, segment-based, embeddable</td></tr><tr><td><code>datafusion</code></td><td>Aggregation query engine</td><td>Rust-native, Arrow ecosystem, extensible</td></tr><tr><td><code>arrow</code></td><td>In-memory columnar format</td><td>Required by DataFusion, zero-copy integration</td></tr><tr><td><code>parquet</code></td><td>Columnar storage format</td><td>Predicate pushdown, compression, DataFusion native</td></tr><tr><td><code>object_store</code></td><td>S3/GCS abstraction</td><td>Re-exported by SlateDB, multi-cloud</td></tr><tr><td><code>flatbuffers</code></td><td>Zero-copy serialization</td><td>Used by SlateDB, zero-copy read</td></tr><tr><td><code>serde</code> / <code>serde_json</code></td><td>JSON attributes</td><td>Standard, required for flexible metadata</td></tr><tr><td><code>axum</code></td><td>HTTP server</td><td>Async, tower ecosystem, production-proven</td></tr><tr><td><code>tonic</code></td><td>gRPC server</td><td>Async, prost ecosystem, OTLP ingest</td></tr><tr><td><code>tokio</code></td><td>Async runtime</td><td>Required by all async deps</td></tr><tr><td><code>thiserror</code></td><td>Error types</td><td>Ergonomic error derivation</td></tr><tr><td><code>tracing</code></td><td>Structured logging</td><td>Standard observability, tokio integration</td></tr><tr><td><code>chrono</code></td><td>Timestamps</td><td>UTC datetime, serde support</td></tr></tbody></table>
+<h3 id="dev-dependencies">Dev Dependencies</h3>
+<table><thead><tr><th>Crate</th><th>Purpose</th></tr></thead><tbody><tr><td><code>criterion</code></td><td>Microbenchmarking (HTML reports + flamegraph support)</td></tr><tr><td><code>insta</code></td><td>Snapshot testing for binary formats</td></tr><tr><td><code>tempfile</code></td><td>Temp directories for test databases</td></tr><tr><td><code>proptest</code></td><td>Property-based testing for key encoding, serialization</td></tr><tr><td><code>rstest</code></td><td>Parameterized tests</td></tr><tr><td><code>mimalloc</code></td><td>Fast allocator for benchmark binaries (default in bench feature)</td></tr></tbody></table>
+<p>No other dependencies without justification.</p>
+<h2 id="guild-workflow">guild workflow</h2>
+<p>guild coordinates tasks (quest) and persistent knowledge (lore) across sessions and agents.</p>
+<p><strong>BEFORE ANY OTHER ACTION</strong> — before reading files, editing code, or responding to the user — call the MCP tool <code>guild_session_start(project="tracelake")</code>. It returns the full agent contract, active principles (oath), and the current top bounty. Follow what it returns.</p>
+<p>If <code>guild_session_start</code> is not visible in your tool list, run your host's tool-search for <code>guild</code> first — some hosts lazy-load MCP tools. Do NOT fall back to CLI; the MCP server is available.</p>
+<h3 id="core-rules-full-contract-is-returned-by-session-start">Core rules (full contract is returned by session_start)</h3>
+<ul><li><strong>Never use built-in task tools</strong> (TaskCreate / TaskUpdate / TaskList) — they're session-scoped. Use <code>quest_post</code> / <code>quest_accept</code> / <code>quest_list</code> instead.</li><li><strong>Accept before working on a quest</strong> — <code>quest_accept(quest_id=...)</code> prevents parallel-agent collisions.</li><li><strong>Appraise before researching</strong> — <code>lore_appraise(query=..., all_projects=true)</code> first. If current entries exist, use them.</li><li><strong>Brief before session end</strong> — when wrapping up or compaction is near, call <code>quest_brief("what was done, what's next, gotchas")</code> without being asked.</li></ul>
+<p>MCP namespace: <code>mcp__guild__*</code>. CLI fallback: <code>guild --help</code> (last resort only).</p>
+<h2 id="10-verification-protocol">10. VERIFICATION PROTOCOL</h2>
+<p>Full details and the coverage manifest: <a href="verification.html">docs/verification.md</a>.</p>
+<ul><li>Every pure function in <code>tracelake-core</code> and the pure query helpers (<code>merge_spans</code>, <code>stats_may_overlap</code>, <code>span_matches</code>, <code>group_spans</code>) is verification-covered: proptest properties, Kani proofs where reachable.</li><li>Before changing any of them: run <code>cargo test --workspace</code> plus <code>cargo kani -p tracelake-core -p tracelake-query</code>.</li><li>New pure functions in those modules require a property test (and a Kani harness when reachable) in the same change.</li><li>Bug fixes in verified code require a failing property first, committed with the fix; commit any generated <code>*.proptest-regressions</code> seed files.</li><li>Never delete or weaken a property to make verification pass.</li><li>SlateDB, tokio, axum, serde, chrono, crc32fast are trusted boundaries — never describe behavior behind them as "verified".</li></ul>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

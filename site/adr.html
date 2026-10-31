@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom schemas decision - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a class="active" href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="decision-user-defined-table-schemas-and-inspect-ai-eval-storage">Decision: user-defined table schemas and inspect-ai eval storage</h1>
+<p>Date: 2026-10-31.</p>
+<h2 id="problem">Problem</h2>
+<p>The database stored one fixed shape, the span. Eval runs from inspect-ai produce a different shape. A sample carries a task, a model, an epoch, a score per scorer, token usage, timings, and a large input and output payload. Teams also want their own tables, not just evals.</p>
+<p>Storing those rows in <code>Span.attributes</code> would have kept the code small and made the queries wrong. Every filter would extract from JSON at query time, which is the cost this database exists to avoid. The trace path already had the right machinery, hot and cold merge, trace packs, bloom filters, stats, manifests, and a single publish point. The task was to give that machinery a schema-driven row without building a second database beside it.</p>
+<h2 id="what-done-means">What done means</h2>
+<p>A user registers a typed schema, writes records, compacts, and queries typed fields with segment pruning and field projection. An inspect-ai eval log travels the same path with no eval-specific code in storage or query. Evidence is a passing suite plus one HTTP test that registers a schema, writes records, queries, compacts, queries again, and ingests an eval log.</p>
+<h2 id="the-shape">The shape</h2>
+<ul><li><code>TableSchema</code> holds a version, a table name, a primary key, and typed fields. <code>validate_shape</code> is the only rule set for the shape, and both construction and loading from the object store call it.</li><li><code>Record</code> holds only fields. Identity comes from the primary-key value through <code>TableSchema::record_id</code>, so a record cannot carry an id that disagrees with its key field.</li><li>Records are validated at <code>put_records</code> and again inside <code>encode_record_pack</code>. Reads trust the schema.</li><li>Hot records live at <code>v1/r/t/{tenant}/ns/{namespace}/tb/{table}/r/{record_id}</code> as JSON. Span keys start with <code>v1/t/</code>, so the two key families cannot read each other's values.</li><li>Compaction writes one <code>TRCREC01</code> pack per table segment, a bloom filter over record ids, per-field stats, and the table manifest. The pack carries its own field descriptors, so a pack written under an older shape stays readable after the schema evolves.</li><li><code>RecordQuery</code> carries one filter tree, a projection, and a limit. <code>RecordQuery::validate</code> checks fields and value types once before any segment read. Segment pruning compares the filter against per-field min and max and against up to 64 distinct string values.</li><li>The inspect-ai adapter is an ingest factory. It emits ordinary records for the ordinary table <code>inspect_ai_samples</code>.</li></ul>
+<h2 id="principles-that-changed-a-decision">Principles that changed a decision</h2>
+<ul><li><strong>Model the domain.</strong> Eval rows became a table with a declared schema instead of loose attributes, and segment bounds became data in the manifest instead of extra branches in the search path.</li><li><strong>Type system discipline.</strong> Removing <code>Record.record_id</code> deleted a state that could disagree with the primary key. Per-pack field descriptors make a type mismatch an error only when the mismatched field is read, instead of a whole-segment failure.</li><li><strong>Boundary discipline.</strong> Validation sits at the two write boundaries and in <code>RecordQuery::validate</code>. The query and merge code trusts the schema.</li><li><strong>Fix root causes.</strong> The pack reader dropped the 4-byte length prefix on strings and JSON. The fix went into <code>read_bytes</code>, the one reader, and a round-trip test now pins it. The duplicated record identity was fixed by removing the second source, not by checking that the two agree.</li><li><strong>Sequence verifiable units.</strong> Core, ingest, compaction, query, and server landed as separate units, each with a green test run before the next started.</li><li><strong>Laziness protocol.</strong> No second storage format, no Parquet files, no new manifest type, no query planner. The record path reuses the existing manifest, bloom filter, checksum helper, pack pattern, and merge rules.</li><li><strong>Prove it works.</strong> The evidence is the HTTP end-to-end test and the full suite, not a clean compile.</li><li><strong>Explain the number.</strong> The benchmark reports run count, range, dataset shape, and the limiter instead of a single speedup.</li></ul>
+<h2 id="design-space">Design space</h2>
+<p>Two design seats ran against the same usage contract and grounding document. Both seats failed on the first launch because the pstack model config named providers this host does not have (<code>anthropic/*</code>, <code>opencode/*</code>), and the only configured provider is <code>openrouter</code>. After the config was pointed at DeepSeek, both seats completed and converged on the same shape: one typed row block with a presence bitmap, a table manifest holding per-field stats, record keys under <code>v1/r/</code>, and inspect-ai as a pure ingest factory. The agreement removed the need to graft one design onto the other.</p>
+<p>Adopted from the first seat: identity derived from the primary key, stored schemas re-validated on load, and an optional score because errored samples have none.</p>
+<p>Adopted from the second seat: filter narrowing as a single gate, and one record body used by both hot and cold paths instead of a second codec.</p>
+<h2 id="rejected-alternatives">Rejected alternatives</h2>
+<ul><li><strong>Attributes only, no schema.</strong> No typed filters, and every query pays JSON extraction per row. This is the design the product exists to replace.</li><li><strong>Column chunks, one file per field.</strong> Needs a second physical layout and a second codec, and the eval table has 17 columns, not thousands. Column files return with the Parquet aggregation step.</li><li><strong>Derive one schema per eval, with a column per scorer.</strong> Scorer names change per eval, and a registered schema is immutable once segments exist, so the table would churn and old packs would stop decoding. Scorer selection stays a caller decision through the <code>scorer</code> and <code>score</code> columns.</li><li><strong>Parquet and DataFusion now.</strong> The project plan holds aggregation for a later step, and record filtering does not need a query engine.</li><li><strong>Schema migration in this change.</strong> Immutable schemas keep packs decodable. Changing a shape today means a new table name.</li></ul>
+<h2 id="verification">Verification</h2>
+<table><thead><tr><th>Tier</th><th>What</th><th>Where</th></tr></thead><tbody><tr><td>PROVEN (pending CI)</td><td>record pack decoder and directory walk never panic under any single ASCII corruption with the checksum restamped</td><td><code>record_pack.rs::verify</code>. The harness exists and CI runs <code>cargo kani -p tracelake-core</code>. A local run exceeded 30 minutes on Apple Silicon CBMC, so this row stays PROPERTY tier until the CI job passes.</td></tr><tr><td>PROPERTY</td><td>pack round trip, projection exactness, foreign schema refusal, arbitrary bytes never panic</td><td><code>tracelake-core/tests/prop_record_pack.rs</code></td></tr><tr><td>PROPERTY</td><td>pruning a segment means no record in it matched, inclusive bounds decompose, boolean laws, absent fields never match</td><td><code>tracelake-query/src/record_query/verification.rs</code></td></tr><tr><td>INTEGRATION</td><td>hot and cold merge, hot wins, bloom negative lookup, stats prune proven by deleting the pruned pack, point lookup</td><td><code>tracelake-query/src/record_query/tests.rs</code></td></tr><tr><td>INTEGRATION</td><td>schema registration, record ingest, query, compaction, eval ingest over HTTP</td><td><code>tracelake-server/src/lib.rs</code></td></tr></tbody></table>
+<p>Commands and results:</p>
+<pre><code class="language-text">cargo test --workspace          # 154 passed, 0 failed, 4 ignored benchmarks
+cargo clippy --workspace --all-targets -- -D warnings   # exit 0
+cargo fmt --check               # clean
+cargo kani -p tracelake-core --harness restamped_corruptions_never_panic_in_decode_or_directory
+                                 # exceeded a 30 minute local timeout; CI owns this check</code></pre>
+<h2 id="bugs-found-and-pinned">Bugs found and pinned</h2>
+<ol><li><code>read_bytes</code> read the length at the cursor but ended the slice at cursor plus length, so every string and JSON field decoded one prefix short and the last field reported a truncation. A temporary probe test printed the pack bytes and the cursor positions, which showed the cursor moving 2 bytes for a 2-byte string. The fix moved the payload start past the prefix. <code>every_declared_type_round_trips_exactly</code> and the round-trip property now fail if it regresses.</li><li><code>Record</code> carried both <code>record_id</code> and a primary-key field. The two could disagree and the pack directory used one while queries used the other. The field is gone.</li><li>An unreachable non-finite float check was removed after the test could not construct a non-finite value, because JSON cannot represent one.</li><li>Delegated design seats failed with "OAuth access token is invalid" and "Insufficient account funds". The cause was model ids for providers this host does not configure. <code>pstack-models.md</code> now names only <code>openrouter/deepseek/deepseek-v4.1-flash-1017</code>.</li></ol>
+<h2 id="revision-schema-evolution">Revision: schema evolution</h2>
+<p>The first version registered one immutable shape per table. That was too strict. The systems this one is measured against do not work that way. turbopuffer infers attribute types per namespace and lets a namespace hold sparse attributes. LanceDB applies add, alter, and drop column operations without rewriting all data. Brainstore keeps indexes and metadata per segment and treats semi-structured data as a first-class citizen rather than shredding it into a fixed schema.</p>
+<p>The shape now is schema-on-read with compatibility rules:</p>
+<ul><li>A record pack stores its own field names and types. A reader maps by name, skips fields the current schema dropped, and fills declared defaults for fields the pack predates.</li><li><code>TableSchema::evolve</code> allows adding optional fields, adding required fields with a default, and dropping fields. It refuses type changes and primary-key changes.</li><li>The registry assigns versions. Old segments are never rewritten.</li><li>Per-field stats carry the type they were computed from, so pruning never compares bounds across a type change.</li></ul>
+<p>The immutable rule cost one recorded bug. Hot records bypassed pack default substitution, so a record written before a defaulted field existed read back without the default when the hot copy won the merge. <code>TableSchema::fill_defaults</code> now runs at the merge boundary for hot records, and the end-to-end test writes a record, compacts, evolves, and reads the default back.</p>
+<p>Still refused: changing a field's type. A pack written as <code>string</code> cannot be read as <code>i64</code> without guessing, so the rule is a new table name and a rewrite. That is a deliberate limit, not an oversight.</p>
+<h2 id="full-text-search-step-7">Full-text search (Step 7)</h2>
+<p>Compaction now builds a Tantivy index over span name, input, output, and error and stores it as the segment <code>.text</code> file. <code>TraceSearch.text_query</code> runs the index per segment, then applies the structural filters. Spans in the hot store are indexed per query into a throwaway index, so recent data is searchable before compaction. The cost of that choice is documented in <code>docs/schemas.md</code>.</p>
+<h2 id="open-questions">Open questions</h2>
+<ul><li>Pruning and hot-store garbage collection. Today the hot store keeps the newest copy of every record, so pruning cannot surface a stale version. If SlateDB starts dropping compacted hot data, a pruned segment could return an old version while a newer one sits in a segment the filter skipped. The fix would be a newest-version guard that reads the newest segment bloom before trusting an older row.</li><li>Aggregation. Per-scorer percentiles and counts need column files or a full pack scan. The eval UI will want them.</li><li>Nested score fields. <code>scores</code> is one JSON column. Filtering on <code>scores.accuracy</code> requires projecting the column and filtering in the client, or a separate typed column chosen at schema time.</li></ul>
+<h2 id="next-step">Next step</h2>
+<p>Aggregation over record packs, so per-scorer counts and percentiles do not require a scan in the client.</p>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

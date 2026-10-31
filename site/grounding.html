@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom schemas grounding - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a class="active" href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="grounding-custom-schemas-for-tracelake-eval-storage-via-inspect-ai">Grounding: custom schemas for TraceLake, eval storage via inspect-ai</h1>
+<p>Read-only context for a design sketch. Do not write source code in the repo; write your sketch to the output path you were given.</p>
+<h2 id="what-tracelake-is">What TraceLake is</h2>
+<p>An open-source database for LLM agent traces. Object storage is the source of truth (S3/GCS), a SlateDB LSM is the hot ingest/WAL layer, and compaction writes immutable segments to the object store. Queries merge hot + compacted.</p>
+<p>Crates (all Rust 2024, edition 2024, <code>thiserror</code> for errors, no <code>unwrap</code> outside tests, every <code>pub fn</code>/<code>pub struct</code> documented, functions under 50 lines):</p>
+<ul><li><code>tracelake-core</code>: data types, key encoding, pack formats, segment manifest. Pure.</li><li><code>tracelake-ingest</code>: SlateDB wrapper (<code>TraceLakeDb</code>), ingest validation.</li><li><code>tracelake-compact</code>: reads hot spans, writes <code>.tracepack</code> + <code>.bloom</code> + <code>.stats</code>, publishes <code>manifest.json</code> per (tenant, namespace).</li><li><code>tracelake-query</code>: <code>get_trace</code>, <code>search_traces</code>, hot/cold merge, stats pruning.</li><li><code>tracelake-server</code>: axum HTTP API.</li></ul>
+<h2 id="existing-shapes-that-the-design-must-interop-with">Existing shapes that the design must interop with</h2>
+<p>Span key (canonical, lexicographic order = query order):</p>
+<pre><code>v1/t/{tenant}/ns/{namespace}/tr/{trace_id}/sp/{20-digit nanosecond start}/{span_id}</code></pre>
+<p><code>encode_span_key</code>, <code>decode_span_key</code>, <code>tenant_prefix</code>, <code>namespace_prefix</code>, <code>trace_prefix</code> live in <code>tracelake-core/src/key.rs</code>. Tenant and namespace segments reject empty values and <code>/</code>.</p>
+<p>Hot store API (<code>TraceLakeDb</code>, <code>tracelake-ingest/src/db.rs</code>): <code>put_span</code>, <code>put_spans</code>, <code>get_trace_spans</code>, <code>get_namespace_spans</code>, <code>scan_all_spans</code>. <code>scan_all_spans</code> currently scans the whole keyspace with an empty prefix.</p>
+<p>Trace pack (<code>tracelake-core/src/trace_pack.rs</code>): <code>[magic TRCPAK01][trace_count u32] [span_count u64][directory_offset u64][trace blocks][directory: u64 entry offsets then entries][crc32 footer]</code>. Directory entries are <code>{trace_id u16 len + bytes, span_count u32, block_offset u64, block_len u64}</code> sorted by trace_id, binary-searched on read. Span payloads are length-prefixed JSON. <code>decode_trace_pack</code> validates magic, checksum, and directory bounds, then <code>read_trace</code> decodes one block only.</p>
+<p>Manifest (<code>tracelake-core/src/segment.rs</code>): <code>SegmentManifest { version, tenant_id, namespace, segments: Vec&amp;lt;SegmentEntry&amp;gt; }</code>, <code>SegmentEntry { segment_id: "segment-000001", trace_count, span_count, files: Vec&amp;lt;SegmentFile&amp;gt;, stats: SegmentStats }</code>, <code>SegmentFile { kind, path, size_bytes, crc32 }</code>, <code>SegmentFileKind { TracePack, Bloom, Stats }</code>, <code>SegmentStats { min/max of start_time, end_time, latency_ms, cost_usd, score }</code>. Published with one PUT at <code>{base_path}/{tenant}/{namespace}/manifest.json</code>.</p>
+<p>Segment files: <code>{base_path}/{tenant}/{namespace}/{segment_id}.{ext}</code>.</p>
+<p>Query: <code>TraceLakeReader { db, store, packs, base_path }</code>; <code>get_trace</code> checks each segment's bloom file, reads the pack on a possible hit, then merges with hot spans (hot wins on <code>span_id</code> conflict, newer segments before older); <code>search_traces</code> prunes segments with <code>stats_may_overlap</code> on <code>start_time</code>, then reads whole packs, dedups by <code>span_id</code>, and summarizes per trace.</p>
+<p>Verification protocol (<code>docs/verification.md</code>): pure functions in <code>tracelake-core</code> and the pure query helpers get a proptest property, and a Kani harness where the solver can reach it. Never weaken a property to pass. Bug fixes land with the failing test first.</p>
+<p>Constraints from <code>AGENTS.md</code>: YAGNI (no auth, no SQL parser, no admin UI, no vector search), one definition of each schema/key/manifest format, async only around I/O, CPU work synchronous, no magic numbers, errors carry context.</p>
+<h2 id="the-task">The task</h2>
+<p>Two deliverables:</p>
+<ol><li>Users define their own schemas. A schema is a named table with typed fields, a primary key, and per-tenant/namespace registration. Values are validated against the schema at the ingest boundary and stored in a typed format, not as opaque JSON.</li><li>Evals from inspect-ai are stored and queried through that mechanism, efficiently: filter and project on declared fields without deserializing every field, and skip whole segments using per-field stats.</li></ol>
+<h2 id="fixed-usage-contract-viewer-facing-api-sketch-derive-your-types-from-it">Fixed usage contract (viewer-facing API sketch; derive your types from it)</h2>
+<pre><code class="language-rust">// Schema definition and registration
+let schema = TableSchema::new("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .field("eval_id", FieldType::String)
+    .field("epoch", FieldType::I64)
+    .field("task", FieldType::String)
+    .field("model", FieldType::String)
+    .field("score", FieldType::F64)          // optional; use required_field instead
+    .primary_key("sample_id");
+let schema = schema.build()?;                // validation, one failure mode per error variant
+
+// Registration (object store is the source of truth)
+schema_registry.put(tenant, namespace, &amp;schema).await?;
+
+// Ingest: validation at the boundary, typed storage underneath
+db.put_records(tenant, namespace, &amp;schema, &amp;records).await?;
+
+// Query: typed filters + projection
+let query = RecordQuery {
+    filter: Some(RecordFilter::And(vec![
+        RecordFilter::Eq { field: "task".into(), value: json!("gsm8k") },
+        RecordFilter::Ge { field: "score".into(), value: json!(0.5) },
+    ])),
+    projection: vec!["sample_id".into(), "score".into()],
+    limit: 100,
+    ..RecordQuery::default()
+};
+let page = reader.query_records(tenant, namespace, "inspect_ai_samples", &amp;query).await?;</code></pre>
+<h2 id="grading-rubric-the-picker-scores-against-these">Grading rubric (the picker scores against these)</h2>
+<ol><li>Type sketches and signatures only, plus the flow. No implementation.</li><li>One unambiguous storage and validation path: no second way to write or read a record.</li><li>Per-field stats and segment pruning are part of the shape, not an afterthought.</li><li>Schema correctness is enforced by types or by one validation point, not scattered checks.</li><li>The eval adapter fits the same mechanism as any user-defined table, with no special case in the storage or query layer.</li><li>Fits the existing crate boundaries and the existing verification protocol; names the proptest and Kani candidates.</li><li>Smallest public surface that hides the most complexity. Explicitly names what it does not do (schema evolution, columnar Parquet, etc.).</li></ol>
+<h2 id="output">Output</h2>
+<p>A design sketch: data structures first (field-by-field), then signatures and data flow, then the module map naming which crate owns each piece, then the storage layout, then the validation points, then the rejected alternatives with one line each on why the alternatives lose. Shapes only. No code bodies.</p>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

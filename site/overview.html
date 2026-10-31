@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project overview - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a class="active" href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="tracelake">TraceLake</h1>
+<p>A purpose-built database for LLM agent traces. Stores trace data in object storage (S3/GCS), uses NVMe/memory as hot cache, and beats generic databases on trace-native workloads.</p>
+<h2 id="what-it-does">What It Does</h2>
+<ul><li><strong>Ingest</strong> spans from any LLM app (OTLP, HTTP, gRPC).</li><li><strong>Fetch</strong> a full trace tree in a single read — not a distributed row reconstruction.</li><li><strong>Search</strong> prompts, outputs, tool errors with a Tantivy full-text index.</li><li><strong>Aggregate</strong> latency, cost, tokens, scores with columnar analytics.</li><li><strong>Define tables</strong> with your own typed schema, including inspect-ai eval samples.</li></ul>
+<p>One database. Three endpoints. No ClickHouse bolt-on. No Elasticsearch bolt-on.</p>
+<h2 id="api">API</h2>
+<p>Three endpoints for traces, plus a small table API for user-defined schemas and eval records. No index creation, no separate analytics system.</p>
+<h3 id="ingest">Ingest</h3>
+<pre><code class="language-rust">async fn ingest_spans(request: IngestRequest) -&gt; Result&lt;IngestResponse&gt;;
+
+struct IngestRequest {
+    spans: Vec&lt;Span&gt;,        // batch of spans, can belong to multiple traces
+    idempotency_keys: bool,  // use span_id as idempotency key (default: true)
+}
+
+struct IngestResponse {
+    accepted: usize,
+    rejected: usize,
+}</code></pre>
+<h3 id="query">Query</h3>
+<pre><code class="language-rust">// Fetch a single trace by ID with all its spans.
+async fn get_trace(trace_id: &amp;str) -&gt; Result&lt;Option&lt;Trace&gt;&gt;;
+
+// Search traces with filters. Call get_trace() to hydrate full payloads.
+async fn search_traces(request: SearchRequest) -&gt; Result&lt;SearchResponse&gt;;
+
+// Run an aggregation query over columnar data.
+async fn aggregate(request: AggregateRequest) -&gt; Result&lt;AggregateResponse&gt;;</code></pre>
+<h3 id="search-filters">Search Filters</h3>
+<p>All optional, all AND-combined. Use exactly one of <code>trace_ids</code> or <code>text_query</code> or the filter set. <code>limit</code> is required (max 1000).</p>
+<pre><code class="language-rust">struct SearchRequest {
+    trace_ids: Option&lt;Vec&lt;String&gt;&gt;,
+    text_query: Option&lt;String&gt;,          // "hallucination AND tool_error"
+    trace_id_prefix: Option&lt;String&gt;,
+    span_types: Option&lt;Vec&lt;SpanType&gt;&gt;,   // LLM, Tool, Agent, Chain, Eval, System, Retriever
+    statuses: Option&lt;Vec&lt;SpanStatus&gt;&gt;,   // Ok, Error, Timeout
+    models: Option&lt;Vec&lt;String&gt;&gt;,
+    tags: Option&lt;Vec&lt;String&gt;&gt;,
+    min_latency_ms: Option&lt;f64&gt;,
+    max_latency_ms: Option&lt;f64&gt;,
+    min_cost_usd: Option&lt;f64&gt;,
+    max_cost_usd: Option&lt;f64&gt;,
+    min_score: Option&lt;f64&gt;,
+    min_start_time: Option&lt;DateTime&lt;Utc&gt;&gt;,
+    max_start_time: Option&lt;DateTime&lt;Utc&gt;&gt;,
+    limit: usize,
+    offset: usize,
+    order_by: SearchOrderBy,             // Time, Latency, Cost, Score, Relevance
+    order_dir: OrderDir,                 // Asc, Desc
+    include_spans: bool,                 // default: true
+    include_attributes: bool,            // default: false
+}</code></pre>
+<h3 id="aggregation">Aggregation</h3>
+<pre><code class="language-rust">struct AggregateRequest {
+    metric: AggregateMetric,             // Latency, Cost, Tokens, Count
+    aggregation: AggFunction,            // P50, P95, P99, Avg, Sum, Min, Max, Count
+    group_by: Vec&lt;GroupBy&gt;,              // Model, SpanType, Status, Hour, Day
+    filters: SearchFilters,               // same filter set as search_traces
+    time_range: TimeRange,                // required
+}</code></pre>
+<h3 id="data-types">Data Types</h3>
+<pre><code class="language-rust">struct Span {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option&lt;String&gt;,
+    span_type: SpanType,
+    name: String,
+    start_time: DateTime&lt;Utc&gt;,
+    end_time: Option&lt;DateTime&lt;Utc&gt;&gt;,
+    status: SpanStatus,
+    attributes: serde_json::Value,
+    input: Option&lt;serde_json::Value&gt;,
+    output: Option&lt;serde_json::Value&gt;,
+    scores: Vec&lt;Score&gt;,
+    tokens: Option&lt;TokenUsage&gt;,
+    cost_usd: Option&lt;f64&gt;,
+    model: Option&lt;String&gt;,
+    provider: Option&lt;String&gt;,
+    error: Option&lt;String&gt;,
+    tags: Vec&lt;String&gt;,
+}
+
+struct Trace {
+    trace_id: String,
+    spans: Vec&lt;Span&gt;,
+}
+
+enum SpanType { LLM, Tool, Retriever, Agent, Chain, Eval, System }
+enum SpanStatus { Ok, Error, Timeout }
+struct Score { name: String, value: f64 }
+struct TokenUsage { prompt: u32, completion: u32, total: u32 }</code></pre>
+<h3 id="custom-tables">Custom tables</h3>
+<p>Define a typed schema, register it, and query it with typed filters and projection.</p>
+<pre><code class="language-rust">let schema = TableSchema::builder("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .required_field("task", FieldType::String)
+    .field("score", FieldType::F64)
+    .primary_key("sample_id")
+    .build()?;
+
+put_schema(&amp;store, base_path, tenant_id, namespace, &amp;schema).await?;
+db.put_records(tenant_id, namespace, &amp;schema, &amp;records).await?;
+
+let result = reader
+    .query_records(tenant_id, namespace, "inspect_ai_samples", &amp;RecordQuery {
+        filter: Some(RecordFilter::ge("score", json!(0.5))),
+        projection: vec!["task".into(), "score".into()],
+        ..RecordQuery::default()
+    })
+    .await?;</code></pre>
+<p>Schemas evolve. Adding an optional field, adding a required field with a default, and dropping a field are allowed; older segments keep their meaning because each pack records its own field list. Changing a field's type needs a new table.</p>
+<p>Aggregation runs over the Parquet column files that compaction writes:</p>
+<pre><code class="language-rust">let result = reader
+    .aggregate_records(tenant_id, namespace, "inspect_ai_samples", &amp;AggregateRequest {
+        group_by: vec!["task".into()],
+        metrics: vec![
+            AggregateMetric::Count,
+            AggregateMetric::Avg { field: "score".into() },
+            AggregateMetric::P95 { field: "total_tokens".into() },
+        ],
+        ..AggregateRequest::default()
+    })
+    .await?;</code></pre>
+<p><code>POST /v1/spans/aggregate</code> does the same for span columns, for example p95 latency grouped by model.</p>
+<p><code>POST /v1/evals</code> registers the eval schema, flattens an inspect-ai log, and writes one row per sample. See <a href="schemas.html">docs/schemas.md</a> for field types, storage layout, query semantics, pruning rules, and measured costs.</p>
+<p>A runnable example, a real inspect-ai eval against GLM-4.7 plus the database queries on its log, is in <a href="evals.html">examples/inspect-ai-evals</a>. Run <code>examples/inspect-ai-evals/run.sh</code> to regenerate the log and the query output.</p>
+<h2 id="documentation">Documentation</h2>
+<p>A static documentation site lives in <code>site/</code>. Open <code>site/index.html</code>, or serve it:</p>
+<pre><code class="language-bash">python3 site/build.py
+python3 -m http.server -d site 8080</code></pre>
+<p>It covers the HTTP API, custom schemas, architecture, operations, security, performance, verification, and research notes. The site is generated from the repository Markdown, so the pages and the source cannot drift.</p>
+<h2 id="architecture">Architecture</h2>
+<p>Database decisions, storage layout, key encoding, read/write paths, and every technical choice with the reasoning.</p>
+<p>See <a href="architecture.html">architecture.md</a>.</p>
+<h2 id="development-guide">Development Guide</h2>
+<p>Build order, coding rules, profiling tools, dependencies.</p>
+<p>See <a href="development.html">AGENTS.md</a>.</p>
+<h2 id="quick-start">Quick Start</h2>
+<pre><code class="language-bash"># Build
+cargo build
+
+# Test
+cargo nextest run
+
+# Lint
+cargo fmt --check
+cargo clippy -- -D warnings
+
+# Benchmark (once tracelake-bench exists)
+cargo bench -p tracelake-bench
+
+# Profile (builds with debug info, links against mimalloc)
+cargo build --profile profiling --bin tracelake-server
+cargo flamegraph --profile profiling --bin tracelake-server</code></pre>
+<h2 id="project-structure">Project Structure</h2>
+<pre><code>tracelake/
+  AGENTS.md                 # coding rules, build steps, profiling, dependencies
+  architecture.md           # database architecture, decisions, storage, data flow
+  idea.md                   # thesis and competitive analysis
+  README.md                 # what it is, API surface, quick start
+  Cargo.toml                # workspace root
+
+  tracelake-core/           # data types, key encoding, serialization
+  tracelake-ingest/         # SlateDB integration, ingest endpoint
+  tracelake-compact/        # compaction pipeline (trace packs, columns, text index)
+  tracelake-query/          # query engine (fetch, search, aggregate)
+  tracelake-server/         # HTTP/gRPC server
+  tracelake-bench/          # benchmark suite</code></pre>
+<h2 id="status">Status</h2>
+<p>Steps 1 to 11 of the build order are implemented: ingest, trace fetch, search, Tantivy text search, Parquet column files with DataFusion aggregation, the HTTP API, custom table schemas with evolution, inspect-ai eval storage, and the benchmark suite. Alpha readiness, security posture, and gaps against SmithDB and Brainstore are recorded in <a href="alpha.html">docs/alpha.md</a>, <a href="security.html">docs/security.md</a>, and <a href="gap-analysis.html">docs/research/gap-analysis.md</a>. Measured latency and the range-read fix are in <a href="performance.html">docs/performance.md</a>.</p>
+<h2 id="license">License</h2>
+<p>TBD</p>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

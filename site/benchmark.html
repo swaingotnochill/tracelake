@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark plan - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a class="active" href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="tracelake-benchmarks">TraceLake Benchmarks</h1>
+<p>Benchmarks are the product contract. TraceLake must beat SmithDB and Brainstore on agent-trace workloads, not just on generic database microbenchmarks.</p>
+<p>Sources checked on 2026-06-03:</p>
+<ul><li>SmithDB launch and performance post: https://www.langchain.com/blog/introducing-smithdb</li><li>Brainstore benchmark post: https://www.braintrust.dev/blog/brainstore-benchmarks</li><li>Brainstore architecture post: https://www.braintrust.dev/blog/brainstore-architecture</li><li>Brainstore platform architecture docs: https://www.braintrust.dev/docs/platform/architecture</li><li>Braintrust faster experiments post: https://www.braintrust.dev/blog/faster-experiments</li></ul>
+<h2 id="1-competitor-benchmarks">1. Competitor Benchmarks</h2>
+<table><thead><tr><th>Workload</th><th>SmithDB Published Number</th><th>Brainstore Published Number</th><th>Notes</th></tr></thead><tbody><tr><td>Trace tree load</td><td>P50 92ms / P99 595ms</td><td>Not publicly reported in same shape</td><td>SmithDB's closest match to full trace inspection.</td></tr><tr><td>Single run load</td><td>P50 71ms / P99 358ms</td><td>Span load 346ms on 3.9M production traces</td><td>Treat as point load of one run/span payload.</td></tr><tr><td>Runs filtering</td><td>P50 82ms / P99 434ms</td><td>Not publicly reported in same shape</td><td>Filter by status, model, metadata, feedback, tags, and time.</td></tr><tr><td>Trace ingestion latency</td><td>P50 630ms / P99 1.47s</td><td>Write latency 6,984ms on 3.9M production traces</td><td>Measure durable ACK and visible read-after-write separately.</td></tr><tr><td>Full-text search</td><td>P50 400ms / P99 870ms</td><td>401ms on 3.9M production traces</td><td>Search prompts, outputs, errors, tool traces, and names.</td></tr><tr><td>Threads filtering</td><td>P50 131ms / P95 268ms</td><td>Not publicly reported in same shape</td><td>Long-running conversation/thread reconstruction.</td></tr><tr><td>Realtime + historical merge</td><td>Not published as a latency table</td><td>Brainstore describes merging WAL realtime data with object-storage columnstore</td><td>Must be tested because correctness and freshness depend on it.</td></tr><tr><td>Large payload handling</td><td>SmithDB notes large fields are separated from core fields</td><td>Brainstore describes typical spans around 50KB and typical traces around 10MB</td><td>Lists must avoid loading full payloads unless requested.</td></tr></tbody></table>
+<h2 id="2-tracelake-target-benchmarks">2. TraceLake Target Benchmarks</h2>
+<p>Targets are intentionally specific to workload shape. Report P50, P95, P99, max, throughput, CPU, memory, object-store operations, bytes read/written, cache hit rate, and result correctness for every run.</p>
+<table><thead><tr><th>Workload</th><th>Dataset</th><th>Target</th></tr></thead><tbody><tr><td>Trace tree load by <code>trace_id</code>, hot cache</td><td>Production-shaped traces</td><td>P50 &lt; 75ms / P99 &lt; 500ms</td></tr><tr><td>Trace tree load by <code>trace_id</code>, cold object-store read</td><td>Production-shaped traces</td><td>P50 &lt; 150ms / P99 &lt; 750ms</td></tr><tr><td>Single run/span load</td><td>Production-shaped traces</td><td>P50 &lt; 60ms / P99 &lt; 300ms</td></tr><tr><td>Runs filtering</td><td>Status/model/metadata/feedback/tags/time</td><td>P50 &lt; 65ms / P99 &lt; 350ms</td></tr><tr><td>Recent failed traces, limit 100</td><td>Latest 24h summaries</td><td>P50 &lt; 75ms / P99 &lt; 400ms</td></tr><tr><td>Full-text search, top 50</td><td>Prompt/output/error/tool text</td><td>P50 &lt; 300ms / P99 &lt; 750ms</td></tr><tr><td>Threads filtering</td><td>Multi-trace conversations</td><td>P50 &lt; 100ms / P95 &lt; 220ms</td></tr><tr><td>Hydrate 100 matching traces</td><td>After filter or full-text search</td><td>P50 &lt; 250ms / P99 &lt; 1s</td></tr><tr><td>p95 latency by model/tool</td><td>24h columnar aggregation</td><td>P50 &lt; 100ms / P99 &lt; 500ms</td></tr><tr><td>Cost/tokens by model/provider</td><td>24h columnar aggregation</td><td>P50 &lt; 100ms / P99 &lt; 500ms</td></tr><tr><td>Fresh read-after-write visibility</td><td>WAL/hot data merged with compacted data</td><td>Visible &lt; 1s, no compaction wait</td></tr><tr><td>Trace ingestion latency</td><td>Durable ACK after WAL/object-store commit</td><td>P50 &lt; 500ms / P99 &lt; 1.2s</td></tr><tr><td>Sustained ingest throughput</td><td>Production-shaped spans</td><td>P0 &gt; 100K spans/s, stretch &gt; 500K spans/s</td></tr><tr><td>Compaction throughput</td><td>Production-shaped spans</td><td>Keeps up with sustained ingest with &lt; 15m lag</td></tr><tr><td>Storage amplification</td><td>Logical TB after compression + indexes</td><td>Track row store, column store, text index, bloom, stats, manifest separately</td></tr></tbody></table>
+<h2 id="3-benchmark-workloads">3. Benchmark Workloads</h2>
+<h3 id="w1-trace-tree-load">W1: Trace Tree Load</h3>
+<p>Input: random <code>trace_id</code> sampled from the loaded corpus.</p>
+<p>Checks:</p>
+<ul><li>Returns every span for the trace.</li><li>Preserves parent/child relationships.</li><li>Sorts spans by <code>start_time</code>.</li><li>Includes full payload only when requested.</li><li>Measures warm cache and cold cache separately.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Manifest lookups.</li><li>Bloom checks.</li><li>Object-store GET count.</li><li>Bytes read from <code>.tracepack</code>.</li><li>Deserialization time.</li><li>Cache hit/miss.</li></ul>
+<h3 id="w2-single-run-span-load">W2: Single Run/Span Load</h3>
+<p>Input: random <code>span_id</code> sampled from traces with varied payload sizes.</p>
+<p>Checks:</p>
+<ul><li>Returns the exact span payload.</li><li>Avoids hydrating unrelated spans when a single span is requested.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Span index lookup latency.</li><li>Trace-pack block read size.</li><li>Payload materialization time.</li></ul>
+<h3 id="w3-runs-filtering">W3: Runs Filtering</h3>
+<p>Inputs:</p>
+<ul><li><code>status in [error, timeout]</code></li><li><code>model in [...]</code></li><li>metadata filters such as <code>tenant</code>, <code>environment</code>, <code>release</code>, <code>thread_id</code></li><li>feedback/score filters</li><li>time range filters</li></ul>
+<p>Checks:</p>
+<ul><li>Results match a correctness oracle built during data generation.</li><li>Pagination is stable.</li><li>Large payload columns are not read for summary-only results.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Segments scanned vs skipped.</li><li>Stats-pruned segments.</li><li>Column chunks read.</li><li>Result materialization time.</li></ul>
+<h3 id="w4-recent-failed-traces">W4: Recent Failed Traces</h3>
+<p>Input: latest 24h, <code>status=error</code>, limit 100, ordered by descending start time.</p>
+<p>Checks:</p>
+<ul><li>Returns summaries for the newest failed traces.</li><li>Includes traces still in WAL/hot data.</li><li>Does not wait for compaction.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Hot-buffer contribution count.</li><li>Compacted segment contribution count.</li><li>Merge and dedupe time.</li></ul>
+<h3 id="w5-full-text-search">W5: Full-Text Search</h3>
+<p>Inputs:</p>
+<ul><li>Rare term in output.</li><li>Common term in prompts.</li><li>Error phrase.</li><li>Tool name.</li><li>Boolean query with metadata/time filter.</li></ul>
+<p>Checks:</p>
+<ul><li>Top 50 results are correct against the generated inverted-index oracle.</li><li>Relevance ordering is deterministic enough for repeated runs.</li><li>Hydration is measured separately from search.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Tantivy/index open time.</li><li>Index files fetched.</li><li>Query execution time.</li><li>Candidate trace count.</li><li>Hydration time.</li></ul>
+<h3 id="w6-threads-filtering">W6: Threads Filtering</h3>
+<p>Input: <code>thread_id</code>, time range, status, score, and model filters.</p>
+<p>Checks:</p>
+<ul><li>Reconstructs all traces in a thread.</li><li>Handles long-running conversations and late span updates.</li><li>Returns thread summaries without loading every prompt/output blob.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Thread index lookups.</li><li>Trace IDs discovered.</li><li>Payload bytes avoided.</li></ul>
+<h3 id="w7-hydrate-100-matching-traces">W7: Hydrate 100 Matching Traces</h3>
+<p>Input: candidate trace IDs from W3 or W5.</p>
+<p>Checks:</p>
+<ul><li>Reads 100 complete trace trees.</li><li>Preserves tree structure.</li><li>Batches object-store reads where possible.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Parallelism.</li><li>Object-store range GET count.</li><li>Total bytes read.</li><li>Decompression and deserialization time.</li></ul>
+<h3 id="w8-aggregations">W8: Aggregations</h3>
+<p>Inputs:</p>
+<ul><li>p95 latency by model/tool over 24h.</li><li>total cost by model/provider over 24h.</li><li>token totals by model/provider over 24h.</li><li>failure rate by release/environment over 24h.</li></ul>
+<p>Checks:</p>
+<ul><li>Results match generated aggregate oracle within exact or documented approximate bounds.</li><li>Predicate pushdown and column pruning work.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Parquet row groups scanned.</li><li>Row groups skipped.</li><li>Bytes read per column.</li><li>DataFusion planning and execution time.</li></ul>
+<h3 id="w9-ingest-latency-and-throughput">W9: Ingest Latency And Throughput</h3>
+<p>Inputs:</p>
+<ul><li>Concurrent span batches.</li><li>Mixed trace sizes.</li><li>Duplicate span IDs for idempotency checks.</li><li>Open spans followed by late updates.</li></ul>
+<p>Checks:</p>
+<ul><li>ACK means durable WAL/object-store commit.</li><li>Duplicate writes are rejected or idempotent.</li><li>Data is query-visible through hot reads before compaction.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Batch size.</li><li>WAL object PUT latency.</li><li>MemTable flush latency.</li><li>Backpressure events.</li><li>Rejected/duplicate spans.</li></ul>
+<h3 id="w10-freshness-merge">W10: Freshness Merge</h3>
+<p>Input: fixed query run while writers continuously append spans.</p>
+<p>Checks:</p>
+<ul><li>Query sees compacted data plus WAL/hot data.</li><li>No duplicate spans when the same trace exists in both paths.</li><li>Visibility lag stays below target.</li></ul>
+<p>Debug counters:</p>
+<ul><li>Hot rows scanned.</li><li>Compacted rows scanned.</li><li>Merge conflicts.</li><li>Visibility lag histogram.</li></ul>
+<h2 id="4-benchmark-datasets">4. Benchmark Datasets</h2>
+<h3 id="d1-smoke-dataset">D1: Smoke Dataset</h3>
+<p>Purpose: fast local debugging.</p>
+<p>Shape:</p>
+<ul><li>10K traces.</li><li>200K spans.</li><li>1 day.</li><li>3 tenants, 10 projects.</li><li>Payloads: 1KB to 50KB.</li></ul>
+<p>Use for:</p>
+<ul><li>Correctness tests.</li><li>Debugging query plans.</li><li>CI smoke benchmark.</li></ul>
+<h3 id="d2-external-comparison-dataset">D2: External Comparison Dataset</h3>
+<p>Purpose: compare with Brainstore's public benchmark scale.</p>
+<p>Shape:</p>
+<ul><li>3.9M traces.</li><li>78M spans if using 20 spans/trace average.</li><li>7 days.</li><li>Payloads: median 10KB span, p95 50KB span, p99 250KB span.</li><li>Trace sizes: median 200KB, p95 10MB.</li></ul>
+<p>Use for:</p>
+<ul><li>Published TraceLake vs SmithDB/Brainstore scorecard.</li><li>Warm and cold read tests.</li><li>Full-text search tests.</li></ul>
+<h3 id="d3-large-synthetic-dataset">D3: Large Synthetic Dataset</h3>
+<p>Purpose: scale stress.</p>
+<p>Shape:</p>
+<ul><li>50M traces.</li><li>1B spans.</li><li>30 days.</li><li>100 tenants, 1,000 projects.</li><li>Zipfian tenant/project distribution.</li><li>Mixed hot and cold shards.</li></ul>
+<p>Use for:</p>
+<ul><li>Manifest scale.</li><li>Segment pruning.</li><li>Compaction throughput.</li><li>Cache locality.</li></ul>
+<h3 id="d4-payload-stress-dataset">D4: Payload Stress Dataset</h3>
+<p>Purpose: test large semi-structured traces.</p>
+<p>Shape:</p>
+<ul><li>100K traces.</li><li>5M spans.</li><li>50KB typical span.</li><li>10MB typical trace.</li><li>Some traces with 1,000+ spans.</li></ul>
+<p>Use for:</p>
+<ul><li>Trace-pack block sizing.</li><li>Payload preview vs full hydration.</li><li>Browser/API-safe response shaping.</li></ul>
+<h3 id="d5-freshness-dataset">D5: Freshness Dataset</h3>
+<p>Purpose: test WAL/hot plus compacted merge.</p>
+<p>Shape:</p>
+<ul><li>1M compacted traces.</li><li>Continuous writer appending 10K to 100K spans/s.</li><li>5% late span updates.</li><li>1% duplicate span retries.</li></ul>
+<p>Use for:</p>
+<ul><li>Read-after-write visibility.</li><li>Dedupe correctness.</li><li>Hot/cold merge latency.</li></ul>
+<h2 id="5-data-generator">5. Data Generator</h2>
+<p>Implement <code>tracelake-bench/src/data_gen.rs</code> as a deterministic generator. Every run takes:</p>
+<pre><code class="language-text">--seed
+--tenant-count
+--project-count
+--trace-count
+--avg-spans-per-trace
+--span-count-distribution
+--payload-size-distribution
+--time-range-days
+--error-rate
+--timeout-rate
+--late-update-rate
+--duplicate-rate
+--thread-rate
+--output-dir</code></pre>
+<p>Generated data must include:</p>
+<ul><li><code>tenant_id</code>, <code>project_id</code>, <code>trace_id</code>, <code>span_id</code>, <code>parent_span_id</code>, <code>thread_id</code>.</li><li><code>span_type</code>: llm, tool, retriever, agent, chain, eval, system.</li><li><code>status</code>: ok, error, timeout.</li><li><code>model</code>, <code>provider</code>, <code>release</code>, <code>environment</code>, tags.</li><li><code>start_time</code>, <code>end_time</code>, latency, cost, prompt tokens, completion tokens.</li><li><code>input</code>, <code>output</code>, <code>error</code>, and <code>attributes</code> payloads.</li><li>Scores and feedback fields.</li><li>Known text terms with controlled frequency for full-text search.</li></ul>
+<p>The generator must write oracle files:</p>
+<ul><li><code>trace_index.parquet</code>: trace_id -&gt; span_ids, thread_id, time range, status.</li><li><code>span_index.parquet</code>: span_id -&gt; trace_id and fixed fields.</li><li><code>filter_oracle.parquet</code>: expected result IDs for common filters.</li><li><code>text_oracle.parquet</code>: expected result IDs for known text terms.</li><li><code>aggregate_oracle.parquet</code>: expected aggregate values.</li></ul>
+<p>The oracle is mandatory. A fast benchmark that returns wrong results is a failed benchmark.</p>
+<h2 id="6-benchmark-harness">6. Benchmark Harness</h2>
+<p>Use two benchmark layers:</p>
+<ol><li>Criterion microbenchmarks for stable, isolated code paths.</li><li>A custom end-to-end load generator for async database workloads.</li></ol>
+<p>Criterion benchmarks:</p>
+<ul><li>Key encoding and decoding.</li><li>Span serialization and deserialization.</li><li>Trace-pack write and read by trace ID.</li><li>Bloom filter lookup.</li><li>Stats pruning.</li><li>Payload preview extraction.</li></ul>
+<p>End-to-end benchmark binary:</p>
+<pre><code class="language-text">tracelake-bench run \
+  --dataset d2 \
+  --object-store s3|minio|memory \
+  --cache warm|cold \
+  --workload trace_load|span_load|runs_filter|recent_failed|text_search|threads|hydrate|aggregate|ingest|freshness \
+  --concurrency 1,8,32,128 \
+  --duration 10m \
+  --sample-rate 1000 \
+  --output results/</code></pre>
+<p>Record results as:</p>
+<ul><li><code>results.jsonl</code>: one row per request with latency, status, bytes, counters, and correctness.</li><li><code>summary.json</code>: P50/P95/P99/max, throughput, errors, cache hit rate, object-store ops.</li><li><code>profile.pb</code>: CPU profile when profiling is enabled.</li><li><code>trace.json</code>: optional tracing export for slow requests.</li></ul>
+<p>Use <code>hdrhistogram</code> or equivalent for latency histograms. Avoid averages as the primary metric; tail latency is the benchmark.</p>
+<h2 id="7-environment-matrix">7. Environment Matrix</h2>
+<p>Run the same benchmark in these environments:</p>
+<table><thead><tr><th>Environment</th><th>Purpose</th></tr></thead><tbody><tr><td>Memory object store</td><td>Correctness and CPU-only baseline.</td></tr><tr><td>Local MinIO on NVMe</td><td>Development object-store behavior without cloud variance.</td></tr><tr><td>S3 Standard or equivalent</td><td>Real cold-read and PUT latency.</td></tr><tr><td>S3 Express One Zone or equivalent</td><td>WAL latency experiment.</td></tr></tbody></table>
+<p>Control variables:</p>
+<ul><li>Region.</li><li>Instance type.</li><li>CPU count.</li><li>RAM.</li><li>NVMe size.</li><li>Cache size.</li><li>Network bandwidth.</li><li>Object-store request rate.</li><li>Segment size.</li><li>Trace-pack block size.</li><li>Compression level.</li></ul>
+<p>For cold-cache runs, restart the query process and clear local cache directories. For warm-cache runs, execute a warmup phase and discard warmup samples.</p>
+<h2 id="8-debug-workflow">8. Debug Workflow</h2>
+<p>When a benchmark misses target:</p>
+<ol><li>Confirm correctness first.</li><li>Split latency into planning, manifest read, index read, object-store read, decompression, deserialization, filtering, merge, and response encoding.</li><li>Compare cold vs warm cache.</li><li>Count object-store operations. A trace load should not turn into many tiny GETs.</li><li>Inspect bytes read. Summary/list queries should not read full prompt/output blobs.</li><li>Profile CPU with <code>pprof</code> or equivalent.</li><li>Enable request tracing for the slowest 1% of requests.</li><li>Run the same workload against memory object store. If it is still slow, the issue is CPU or format layout, not object storage.</li><li>Run with one tenant/project/shard. If it gets fast, the issue is routing or pruning.</li><li>Validate segment sizes and cache hit rate.</li></ol>
+<p>Every benchmark failure should produce:</p>
+<ul><li>Reproduction command.</li><li>Dataset seed.</li><li>Slow request trace.</li><li>Query plan.</li><li>Object-store operation summary.</li><li>CPU profile if CPU-bound.</li></ul>
+<h2 id="9-reporting">9. Reporting</h2>
+<p>Publish a benchmark report with:</p>
+<ul><li>Source commit.</li><li>Dataset config and seed.</li><li>Environment config.</li><li>Object-store type and region.</li><li>Cache mode.</li><li>Workload mix.</li><li>Correctness result.</li><li>Latency table.</li><li>Throughput table.</li><li>Cost estimate from bytes stored and object-store operations.</li><li>Notes on known bottlenecks.</li></ul>
+<p>Do not claim TraceLake beats SmithDB or Brainstore unless:</p>
+<ul><li>The workload shape matches the published competitor workload.</li><li>The dataset scale is disclosed.</li><li>Correctness passes.</li><li>Cold and warm cache behavior are separated.</li><li>Ingest ACK semantics are stated.</li><li>Full-text search latency is separated from hydration latency.</li></ul>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

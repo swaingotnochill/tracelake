@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance review - TraceLake</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<a class="brand" href="index.html">TraceLake</a>
+<p class="nav-section">Guides</p><ul>
+<li><a href="overview.html">Project overview</a></li>
+<li><a href="development.html">Development guide</a></li>
+<li><a href="evals.html">inspect-ai evals</a></li>
+</ul>
+<p class="nav-section">Reference</p><ul>
+<li><a href="api.html">HTTP API</a></li>
+<li><a href="schemas.html">Custom table schemas</a></li>
+</ul>
+<p class="nav-section">Architecture</p><ul>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<p class="nav-section">Operations</p><ul>
+<li><a href="alpha.html">Alpha readiness</a></li>
+<li><a class="active" href="performance.html">Performance review</a></li>
+<li><a href="security.html">Security review</a></li>
+<li><a href="verification.html">Verification</a></li>
+<li><a href="benchmark.html">Benchmark plan</a></li>
+</ul>
+<p class="nav-section">Research</p><ul>
+<li><a href="gap-analysis.html">Gap analysis</a></li>
+<li><a href="adr.html">Custom schemas decision</a></li>
+<li><a href="grounding.html">Custom schemas grounding</a></li>
+<li><a href="fv-brief.html">Formal verification brief</a></li>
+<li><a href="rocq.html">Rocq of Rust assessment</a></li>
+<li><a href="fv-report.html">FV implementation report</a></li>
+</ul>
+</aside>
+<main>
+<article>
+<h1 id="performance-review">Performance review</h1>
+<p>Reviewed on 2026-10-31 with <code>tracelake-bench</code>. The review found one defect worth fixing immediately: a cold trace fetch cost grew with segment size instead of trace size. It is fixed.</p>
+<h2 id="method">Method</h2>
+<ul><li>Hardware: Apple Silicon, 8 cores, macOS, load average about 10 during the runs because other work was running. Absolute times are inflated; ratios hold.</li><li>Build: <code>--release</code>.</li><li>Store: in-memory object store, so timings include serialization, decoding, indexing, and range copies. They exclude network latency. A production S3 run adds one GET per range, roughly 20 to 80 ms on a cold connection.</li><li>Dataset: 1,000 traces by 10 spans, 2 KB payload per input and output field, about 46 MB serialized.</li><li>Each run executes every phase once, in order, and each phase asserts its row and trace counts, so a timing cannot describe work that did not happen.</li><li>Three runs: 2026-10-31, same binary, same machine.</li></ul>
+<h2 id="results">Results</h2>
+<table><thead><tr><th>Phase</th><th>Median</th><th>Range</th></tr></thead><tbody><tr><td>Ingest, one batch</td><td>176 ms, 56.9k spans/s</td><td>174 to 275 ms</td></tr><tr><td>Compact (pack, bloom, stats, Tantivy, Parquet)</td><td>957 ms, 10.4k spans/s</td><td>921 to 1,008 ms</td></tr><tr><td>Fetch cold, first trace</td><td>0.36 ms</td><td>0.24 to 0.39 ms</td></tr><tr><td>Fetch cold, warm loop</td><td>169 us per trace</td><td>160 to 171 us</td></tr><tr><td>Fetch hot</td><td>153 us per trace</td><td>153 to 165 us</td></tr><tr><td>Search cold, status filter</td><td>123 ms for 100 traces</td><td>118 to 135 ms</td></tr><tr><td>Text search cold</td><td>122 ms for 100 traces</td><td>113 to 123 ms</td></tr><tr><td>Aggregate spans, group by model</td><td>10.9 ms</td><td>9.9 to 36.6 ms</td></tr></tbody></table>
+<p>The aggregate range is wide because the first run paid one-time setup. The suite's own correctness counts: 6 matching traces found by the status search with a 100-trace limit, 2 model groups in the aggregate.</p>
+<h2 id="the-defect-and-the-fix">The defect and the fix</h2>
+<p>Before the review, a cold fetch read and checksummed the entire segment pack. A 46 MB pack took 9.9 ms per trace. Scaling the corpus confirmed the limiter:</p>
+<table><thead><tr><th>Corpus</th><th>Pack size</th><th>Cold fetch per trace</th></tr></thead><tbody><tr><td>100 traces</td><td>4 MB</td><td>1.15 ms</td></tr><tr><td>500 traces</td><td>23 MB</td><td>5.1 ms</td></tr><tr><td>1,000 traces</td><td>46 MB</td><td>9.9 ms</td></tr></tbody></table>
+<p>The cost was linear in pack size and independent of trace size, which is exactly wrong for the primary query.</p>
+<p>The fix has two parts. Each trace block now carries its own CRC32 in the pack directory, and <code>TracePackWriter::read_trace</code> fetches three ranges instead of the whole object: the header, the directory, and the one block that holds the trace. The block checksum is verified after the range read. A corrupted block is reported even when the whole-pack footer has been restamped, which a unit test pins.</p>
+<p>After the fix, the same fetch is 0.14 to 0.17 ms and does not grow with the pack:</p>
+<table><thead><tr><th>Corpus</th><th>Pack size</th><th>Cold fetch per trace (after)</th></tr></thead><tbody><tr><td>100 traces</td><td>4 MB</td><td>160 us</td></tr><tr><td>1,000 traces</td><td>46 MB</td><td>135 us</td></tr></tbody></table>
+<p>That is about 60 times faster at 46 MB, and the cost now follows the trace.</p>
+<h2 id="remaining-limits">Remaining limits</h2>
+<ul><li><strong>Search reads whole packs.</strong> A structural search decodes every matching segment pack, so its cost follows segment size. Pruning by stats and time is what keeps it bounded. Column files and per-field indexes would remove this.</li><li><strong>Compaction is single-threaded and has no scheduler.</strong> It compacts only keys above the namespace watermark and deletes those hot keys, so repeat runs do no work. One run still builds one segment, so segment size follows the hot buffer.</li><li><strong>Text search over hot data builds an index per query.</strong> It is correct, not cheap. Compaction moves data into indexed segments, after which text search reads one segment index object per segment.</li><li><strong>Aggregation has no filter pushdown.</strong> A filtered aggregate reads every column file for the table.</li><li><strong>No query timeout or concurrency cap.</strong> A broad query can occupy a core for seconds.</li></ul>
+<h2 id="reproduce">Reproduce</h2>
+<pre><code class="language-bash">cargo run --release -p tracelake-bench
+cargo run --release -p tracelake-bench -- --traces 100 --spans 10 --payload 2048</code></pre>
+<p>The output states the dataset shape, the elapsed time, the rate, and a correctness count for each phase.</p>
+</article>
+<footer>
+<p>TraceLake documentation. Built from the repository Markdown by <code>site/build.py</code>.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
