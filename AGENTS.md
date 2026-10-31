@@ -127,14 +127,18 @@ tracelake/
   tracelake-core/               # data types, key encoding, serialization
     src/
       span.rs                   # Span, Trace, Score, TokenUsage types
-      key.rs                    # key encoding/decoding for SlateDB
+      schema.rs                 # user-defined table schemas and records
+      key.rs                    # span and record key encoding/decoding for SlateDB
       trace_pack.rs             # trace pack format (write + read)
-      segment.rs                # segment manifest format
+      record_pack.rs            # typed record pack format (write + read)
+      segment.rs                # segment manifest and per-field stats formats
+      crc.rs                    # shared checksum
 
   tracelake-ingest/             # SlateDB integration, ingest endpoint
     src/
-      db.rs                     # SlateDB setup, config, segment extractor
+      db.rs                     # SlateDB setup, hot span and record access
       ingest.rs                 # ingest logic (validate, batch, write to SlateDB)
+      inspect_ai.rs             # inspect-ai eval log to record adapter
 
   tracelake-compact/            # compaction pipeline
     src/
@@ -145,6 +149,9 @@ tracelake/
       bloom_writer.rs           # builds .bloom
       stats_writer.rs           # builds .stats
       manifest_writer.rs        # builds .manifest
+      schema_store.rs           # registers and loads table schemas
+      record_compactor.rs       # builds record segments per table
+      record_stats_writer.rs    # per-field bounds for record pruning
 
   tracelake-query/              # query engine
     src/
@@ -152,6 +159,7 @@ tracelake/
       trace_fetch.rs            # get_trace() implementation
       search.rs                 # search_traces() implementation
       aggregate.rs              # aggregate() implementation (DataFusion)
+      record_query.rs           # typed record filters, projection, segment pruning
       merge.rs                  # merge hot (SlateDB) + compacted results
 
   tracelake-server/             # HTTP/gRPC server
@@ -307,6 +315,20 @@ Run end-to-end: ingest → compact → query.
 Implement the benchmark suite described in [benchmark.md](benchmark.md). Do not claim
 performance wins until the benchmark harness proves correctness, discloses dataset shape,
 and separates warm-cache, cold-cache, ingest, search, hydration, and freshness results.
+
+### Step 11: Custom Table Schemas and Eval Storage
+
+Users define typed tables. Each table registers one schema per (tenant, namespace),
+validated on construction and again on load. Records are validated at the ingest boundary,
+stored in the hot store under a record key family, compacted into typed record packs with
+per-field stats, and queried with typed filters, projection, and segment pruning. Eval
+runs from inspect-ai are stored as ordinary rows of the `inspect_ai_samples` table.
+
+Reference: [docs/schemas.md](docs/schemas.md). Decision trail:
+[docs/research/adr-custom-schemas.md](docs/research/adr-custom-schemas.md).
+
+Verify: register a schema, write records, query hot, compact, query cold with a filter
+that prunes segments, and ingest an inspect-ai log over HTTP.
 
 ---
 

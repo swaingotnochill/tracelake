@@ -9,12 +9,14 @@ uses NVMe/memory as hot cache, and beats generic databases on trace-native workl
 - **Fetch** a full trace tree in a single read — not a distributed row reconstruction.
 - **Search** prompts, outputs, tool errors with full-text search.
 - **Aggregate** latency, cost, tokens, scores with columnar analytics.
+- **Define tables** with your own typed schema, including inspect-ai eval samples.
 
 One database. Three endpoints. No ClickHouse bolt-on. No Elasticsearch bolt-on.
 
 ## API
 
-Three endpoints. Push spans, query traces. No admin, no schema management, no index creation.
+Three endpoints for traces, plus a small table API for user-defined schemas and eval
+records. No index creation, no separate analytics system.
 
 ### Ingest
 
@@ -122,6 +124,34 @@ struct Score { name: String, value: f64 }
 struct TokenUsage { prompt: u32, completion: u32, total: u32 }
 ```
 
+### Custom tables
+
+Define a typed schema, register it, and query it with typed filters and projection.
+
+```rust
+let schema = TableSchema::builder("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .required_field("task", FieldType::String)
+    .field("score", FieldType::F64)
+    .primary_key("sample_id")
+    .build()?;
+
+put_schema(&store, base_path, tenant_id, namespace, &schema).await?;
+db.put_records(tenant_id, namespace, &schema, &records).await?;
+
+let result = reader
+    .query_records(tenant_id, namespace, "inspect_ai_samples", &RecordQuery {
+        filter: Some(RecordFilter::ge("score", json!(0.5))),
+        projection: vec!["task".into(), "score".into()],
+        ..RecordQuery::default()
+    })
+    .await?;
+```
+
+`POST /v1/evals` registers the eval schema, flattens an inspect-ai log, and writes one row
+per sample. See [docs/schemas.md](docs/schemas.md) for field types, storage layout, query
+semantics, pruning rules, and measured costs.
+
 ## Architecture
 
 Database decisions, storage layout, key encoding, read/write paths, and every
@@ -176,7 +206,8 @@ tracelake/
 
 ## Status
 
-Early development. See AGENTS.md Step 1 for the first task.
+Steps 1 to 9 of the build order are done, and Step 11 adds custom table schemas and
+inspect-ai eval storage. Step 10, the benchmark suite, is next. See [AGENTS.md](AGENTS.md).
 
 ## License
 
