@@ -648,6 +648,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregation_reads_segments_written_before_a_schema_change() {
+        let app = build_router(test_state().await);
+
+        let v1 = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "severity", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-1", "severity": "high" }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let v2 = json!({
+            "version": 2,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "severity", "field_type": "string", "required": true },
+                { "name": "confidence", "field_type": "f64", "required": false }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v2),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [
+                { "finding_id": "f-2", "severity": "low", "confidence": 0.9 }
+            ] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/aggregate",
+            Some(json!({
+                "group_by": ["severity"],
+                "metrics": ["count", { "avg": { "field": "confidence" } }]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let rows = body["rows"].as_array().expect("rows");
+        let high = rows
+            .iter()
+            .find(|row| row["severity"] == "high")
+            .expect("high row");
+        assert_eq!(high["count"], 1);
+        assert!(high["avg_confidence"].is_null());
+
+        let low = rows
+            .iter()
+            .find(|row| row["severity"] == "low")
+            .expect("low row");
+        assert_eq!(low["count"], 1);
+        assert_eq!(low["avg_confidence"], 0.9);
+    }
+
+    #[tokio::test]
     async fn custom_tables_accept_records_only_after_schema_registration() {
         let app = build_router(test_state().await);
         let schema = json!({

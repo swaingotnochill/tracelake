@@ -237,7 +237,8 @@ Steps 1 to 11 of the build order are implemented: ingest, trace fetch, search,
 Tantivy text search, Parquet column files with DataFusion aggregation, the HTTP
 API, custom table schemas with evolution, inspect-ai eval storage, and the
 benchmark suite. Alpha readiness, security posture, and gaps against SmithDB and
-Brainstore are recorded in [docs/security.md](docs/security.md) and
+Brainstore are recorded in [docs/alpha.md](docs/alpha.md),
+[docs/security.md](docs/security.md), and
 [docs/research/gap-analysis.md](docs/research/gap-analysis.md).
 
 ## License

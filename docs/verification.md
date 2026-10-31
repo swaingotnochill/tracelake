@@ -75,7 +75,9 @@ catches that. That is the boundary, stated plainly.
 ```bash
 cargo test --workspace                     # everything incl. proptest suites (seconds)
 cargo kani -p tracelake-core               # PROVEN tier, core (minutes)
-cargo kani -p tracelake-query              # PROVEN tier, merge laws
+cargo kani -p tracelake-query              # PROVEN tier, merge and prune laws
+cargo kani -p tracelake-core --harness field_type_tags_round_trip
+cargo kani -p tracelake-query --harness ge_prune_means_the_segment_max_is_below_the_bound
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
