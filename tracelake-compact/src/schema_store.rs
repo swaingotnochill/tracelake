@@ -35,53 +35,59 @@ pub async fn read_schema(
     }
 }
 
-/// Registers a schema once. Re-registering the same shape is a no-op; a
-/// different shape is refused because published packs were written under the
-/// old fingerprint and would no longer decode.
+/// Registers a table schema and returns the version the registry now holds.
+///
+/// An identical shape returns the existing schema. A compatible shape is
+/// stored as the next version, so packs written under earlier versions stay
+/// readable. An incompatible shape is refused.
 pub async fn put_schema(
     store: &Arc<dyn ObjectStore>,
     base_path: &str,
     tenant_id: &str,
     namespace: &str,
     schema: &TableSchema,
-) -> Result<(), CompactError> {
+) -> Result<TableSchema, CompactError> {
     schema.validate_shape()?;
 
-    if let Some(existing) =
-        read_schema(store, base_path, tenant_id, namespace, &schema.table).await?
-    {
-        if existing.fingerprint() != schema.fingerprint() {
-            return Err(CompactError::SchemaConflict {
-                table: schema.table.clone(),
-            });
+    let next = match read_schema(store, base_path, tenant_id, namespace, &schema.table).await? {
+        None => {
+            let mut first = schema.clone();
+            first.version = 1;
+            first
         }
+        Some(existing) => {
+            if existing.same_shape(schema) {
+                return Ok(existing);
+            }
 
-        return Ok(());
-    }
+            existing.evolve(schema)?;
+            let mut next = schema.clone();
+            next.version = existing.version + 1;
+            next
+        }
+    };
 
-    let path = schema_path(base_path, tenant_id, namespace, &schema.table);
-    let bytes = serde_json::to_vec(schema)?;
+    let path = schema_path(base_path, tenant_id, namespace, &next.table);
+    let bytes = serde_json::to_vec(&next)?;
     store.put(&Path::from(path.as_str()), bytes.into()).await?;
 
-    Ok(())
+    Ok(next)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use slatedb::object_store::memory::InMemory;
-    use tracelake_core::FieldType;
+    use tracelake_core::{EvolutionError, FieldType};
 
-    fn notes_schema(extra: Option<(&str, FieldType)>) -> TableSchema {
-        let mut builder = TableSchema::builder("notes")
+    fn notes_schema() -> TableSchema {
+        TableSchema::builder("notes")
             .field("id", FieldType::String)
-            .field("body", FieldType::String);
-
-        if let Some((name, field_type)) = extra {
-            builder = builder.field(name, field_type);
-        }
-
-        builder.primary_key("id").build().expect("schema builds")
+            .field("body", FieldType::String)
+            .primary_key("id")
+            .build()
+            .expect("schema builds")
     }
 
     fn store() -> Arc<dyn ObjectStore> {
@@ -100,51 +106,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_schema_round_trips_through_the_store() {
+    async fn the_first_registration_is_version_one() {
         let store = store();
-        let schema = notes_schema(Some(("score", FieldType::F64)));
 
-        put_schema(&store, "base", "tenant-1", "default", &schema)
+        let registered = put_schema(&store, "base", "tenant-1", "default", &notes_schema())
             .await
             .expect("put should succeed");
         let found = read_schema(&store, "base", "tenant-1", "default", "notes")
             .await
             .expect("read should succeed");
 
-        assert_eq!(found, Some(schema));
+        assert_eq!(registered.version, 1);
+        assert_eq!(found, Some(registered));
     }
 
     #[tokio::test]
-    async fn re_registering_the_same_shape_is_a_no_op_and_a_new_shape_is_refused() {
+    async fn an_identical_shape_is_a_no_op() {
         let store = store();
-        let schema = notes_schema(None);
-
-        put_schema(&store, "base", "tenant-1", "default", &schema)
+        let first = put_schema(&store, "base", "tenant-1", "default", &notes_schema())
             .await
             .expect("first put should succeed");
-        put_schema(&store, "base", "tenant-1", "default", &schema)
+        let second = put_schema(&store, "base", "tenant-1", "default", &notes_schema())
             .await
             .expect("identical put should be a no-op");
 
-        let error = put_schema(
-            &store,
-            "base",
-            "tenant-1",
-            "default",
-            &notes_schema(Some(("score", FieldType::F64))),
-        )
-        .await
-        .expect_err("a different shape must be refused");
+        assert_eq!(first, second);
+    }
 
-        assert!(matches!(error, CompactError::SchemaConflict { .. }));
+    #[tokio::test]
+    async fn an_added_optional_field_becomes_the_next_version() {
+        let store = store();
+        put_schema(&store, "base", "tenant-1", "default", &notes_schema())
+            .await
+            .expect("first put should succeed");
+
+        let evolved = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .field("body", FieldType::String)
+            .field("author", FieldType::String)
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let registered = put_schema(&store, "base", "tenant-1", "default", &evolved)
+            .await
+            .expect("a compatible shape should evolve");
+
+        assert_eq!(registered.version, 2);
+        assert_eq!(
+            read_schema(&store, "base", "tenant-1", "default", "notes")
+                .await
+                .unwrap(),
+            Some(registered)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_field_is_allowed() {
+        let store = store();
+        let with_body = notes_schema();
+        put_schema(&store, "base", "tenant-1", "default", &with_body)
+            .await
+            .unwrap();
+
+        let without_body = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let registered = put_schema(&store, "base", "tenant-1", "default", &without_body)
+            .await
+            .expect("dropping a field should evolve");
+
+        assert_eq!(registered.version, 2);
+        assert!(registered.field("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_type_change_and_a_bare_required_field_are_refused() {
+        let store = store();
+        put_schema(&store, "base", "tenant-1", "default", &notes_schema())
+            .await
+            .unwrap();
+
+        let retyped = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .field("body", FieldType::I64)
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let error = put_schema(&store, "base", "tenant-1", "default", &retyped)
+            .await
+            .expect_err("a type change must be refused");
+        assert!(matches!(
+            error,
+            CompactError::Evolution(EvolutionError::TypeChanged { .. })
+        ));
+
+        let added_required = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .field("body", FieldType::String)
+            .required_field("author", FieldType::String)
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let error = put_schema(&store, "base", "tenant-1", "default", &added_required)
+            .await
+            .expect_err("a required field without a default must be refused");
+        assert!(matches!(
+            error,
+            CompactError::Evolution(EvolutionError::RequiredWithoutDefault { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_required_field_with_a_default_evolves() {
+        let store = store();
+        put_schema(&store, "base", "tenant-1", "default", &notes_schema())
+            .await
+            .unwrap();
+
+        let with_default = TableSchema::builder("notes")
+            .field("id", FieldType::String)
+            .field("body", FieldType::String)
+            .required_field_with_default("author", FieldType::String, json!("unknown"))
+            .primary_key("id")
+            .build()
+            .unwrap();
+        let registered = put_schema(&store, "base", "tenant-1", "default", &with_default)
+            .await
+            .expect("a defaulted required field should evolve");
+
+        assert_eq!(registered.version, 2);
+        assert_eq!(
+            registered
+                .field("author")
+                .and_then(|field| field.default.clone()),
+            Some(json!("unknown"))
+        );
     }
 
     #[tokio::test]
     async fn schemas_are_isolated_by_tenant_namespace_and_table() {
         let store = store();
-        let schema = notes_schema(None);
-
-        put_schema(&store, "base", "tenant-1", "default", &schema)
+        put_schema(&store, "base", "tenant-1", "default", &notes_schema())
             .await
             .expect("put should succeed");
 
@@ -164,7 +268,7 @@ mod tests {
     async fn a_stored_schema_with_a_foreign_primary_key_is_rejected_on_read() {
         let store = store();
         let path = schema_path("base", "tenant-1", "default", "notes");
-        let mut value = serde_json::to_value(notes_schema(None)).unwrap();
+        let mut value = serde_json::to_value(notes_schema()).unwrap();
         value["fields"][0]["field_type"] = serde_json::json!("i64");
         store
             .put(

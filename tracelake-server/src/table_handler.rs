@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracelake_compact::{CompactError, put_schema, read_schema};
 use tracelake_core::{Record, TableSchema};
-use tracelake_ingest::{EvalLog, IngestError, eval_sample_schema, ingest_eval_log};
+use tracelake_ingest::{EvalLog, IngestError, eval_sample_schema, sample_records};
 use tracelake_query::{QueryError, RecordQuery};
 
 use crate::AppState;
@@ -34,8 +34,8 @@ pub struct EvalsBody {
     pub log: EvalLog,
 }
 
-/// Registers a table schema. Re-registering the same shape is a no-op; a
-/// different shape is refused so published packs stay decodable.
+/// Registers a table schema. An identical shape is a no-op, a compatible
+/// change becomes the next version, and an incompatible change is refused.
 pub async fn put_table_schema(
     State(state): State<AppState>,
     Path((tenant_id, namespace, table)): Path<(String, String, String)>,
@@ -48,7 +48,7 @@ pub async fn put_table_schema(
         )));
     }
 
-    put_schema(
+    let registered = put_schema(
         &state.store,
         &state.base_path,
         &tenant_id,
@@ -57,17 +57,15 @@ pub async fn put_table_schema(
     )
     .await
     .map_err(|error| match error {
-        CompactError::SchemaConflict { .. } => (
-            StatusCode::CONFLICT,
-            Json(ErrorBody {
-                error: error.to_string(),
-            }),
-        ),
+        CompactError::Evolution(ref evolution) => evolution_error(evolution),
         CompactError::Schema(_) => bad_request(error.to_string()),
         other => server_error(other.to_string()),
     })?;
 
-    Ok((StatusCode::OK, Json(json!({ "table": table }))))
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "table": table, "version": registered.version })),
+    ))
 }
 
 /// Reads the registered schema for one table.
@@ -163,32 +161,43 @@ pub async fn post_evals(
     State(state): State<AppState>,
     Json(body): Json<EvalsBody>,
 ) -> ApiResult<Value> {
-    let schema = eval_sample_schema();
-    put_schema(
+    let schema = match read_schema(
         &state.store,
         &state.base_path,
         &body.tenant_id,
         &body.namespace,
-        &schema,
+        tracelake_ingest::EVAL_SAMPLE_TABLE,
     )
     .await
-    .map_err(|error| match error {
-        CompactError::SchemaConflict { .. } => (
-            StatusCode::CONFLICT,
-            Json(ErrorBody {
-                error: error.to_string(),
-            }),
-        ),
-        other => server_error(other.to_string()),
-    })?;
+    .map_err(|error| server_error(error.to_string()))?
+    {
+        Some(registered) => registered,
+        None => put_schema(
+            &state.store,
+            &state.base_path,
+            &body.tenant_id,
+            &body.namespace,
+            &eval_sample_schema(),
+        )
+        .await
+        .map_err(|error| server_error(error.to_string()))?,
+    };
 
-    let written = ingest_eval_log(&state.db, &body.tenant_id, &body.namespace, &body.log)
+    let mut records =
+        sample_records(&body.log, None).map_err(|error| bad_request(error.to_string()))?;
+    for record in &mut records {
+        record.fields.retain(|name, _| schema.field(name).is_some());
+    }
+
+    state
+        .db
+        .put_records(&body.tenant_id, &body.namespace, &schema, &records)
         .await
         .map_err(ingest_error)?;
 
     Ok((
         StatusCode::OK,
-        Json(json!({ "written": written, "table": schema.table })),
+        Json(json!({ "written": records.len(), "table": schema.table })),
     ))
 }
 
@@ -231,6 +240,20 @@ fn query_error(error: QueryError) -> (StatusCode, Json<ErrorBody>) {
         status,
         Json(ErrorBody {
             error: error.to_string(),
+        }),
+    )
+}
+
+fn evolution_error(evolution: &tracelake_core::EvolutionError) -> (StatusCode, Json<ErrorBody>) {
+    let status = match evolution {
+        tracelake_core::EvolutionError::RequiredWithoutDefault { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::CONFLICT,
+    };
+
+    (
+        status,
+        Json(ErrorBody {
+            error: evolution.to_string(),
         }),
     )
 }

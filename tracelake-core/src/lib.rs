@@ -15,8 +15,8 @@ pub use key::{
 };
 
 pub use schema::{
-    FieldDef, FieldType, FieldValue, Record, RecordError, SCHEMA_VERSION, SchemaBuilder,
-    SchemaError, TableSchema, typed_value,
+    EvolutionError, FieldDef, FieldType, FieldValue, Record, RecordError, SCHEMA_VERSION,
+    SchemaBuilder, SchemaError, TableSchema, typed_value,
 };
 
 pub use segment::{
@@ -26,5 +26,7 @@ pub use segment::{
 
 pub use span::{EvalScore, Span, SpanStatus, SpanType, TokenUsage, Trace};
 
-pub use record_pack::{RecordPack, RecordPackError, decode_record_pack, encode_record_pack};
+pub use record_pack::{
+    PackField, RecordPack, RecordPackError, decode_record_pack, encode_record_pack,
+};
 pub use trace_pack::{TracePack, TracePackError, decode_trace_pack, encode_trace_pack};

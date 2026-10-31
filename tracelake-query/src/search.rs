@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::path::Path;
 use std::collections::{HashMap, HashSet};
+use tracelake_compact::{build_text_index, group_spans, search_text_index};
 use tracelake_core::{
-    SegmentEntry, SegmentFileKind, SegmentStats, Span, SpanStatus, decode_trace_pack,
+    SegmentEntry, SegmentFileKind, SegmentStats, Span, SpanStatus, Trace, decode_trace_pack,
     namespace_prefix,
 };
 
@@ -31,6 +32,10 @@ pub struct TraceSearch {
     /// Match spans whose model equals this string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Full-text query over span name, input, output, and error. A trace
+    /// matches when any of its spans matches the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_query: Option<String>,
     /// Maximum number of traces to return, most recent match first.
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -47,6 +52,7 @@ impl Default for TraceSearch {
             time_end: None,
             status: None,
             model: None,
+            text_query: None,
             limit: DEFAULT_SEARCH_LIMIT,
         }
     }
@@ -87,11 +93,27 @@ impl TraceLakeReader {
     ) -> Result<Vec<TraceSummary>, QueryError> {
         namespace_prefix(tenant_id, namespace)?;
 
-        let mut by_trace: HashMap<String, HashMap<String, Span>> = HashMap::new();
-
         let manifest =
             tracelake_compact::read_manifest(&self.store, &self.base_path, tenant_id, namespace)
                 .await?;
+        let hot_spans = self.db.get_namespace_spans(tenant_id, namespace).await?;
+        let text_hits = self
+            .text_hits(manifest.as_ref(), &hot_spans, search)
+            .await?;
+
+        let mut by_trace: HashMap<String, HashMap<String, Span>> = HashMap::new();
+        let mut keep = |span: Span| {
+            if let Some(hits) = &text_hits
+                && !hits.contains(&span.trace_id)
+            {
+                return;
+            }
+            by_trace
+                .entry(span.trace_id.clone())
+                .or_default()
+                .insert(span.span_id.clone(), span);
+        };
+
         if let Some(manifest) = manifest {
             for entry in &manifest.segments {
                 if !stats_may_overlap(&entry.stats, search) {
@@ -100,19 +122,15 @@ impl TraceLakeReader {
 
                 for spans in self.read_segment_traces(entry).await? {
                     for span in spans {
-                        let trace = by_trace.entry(span.trace_id.clone()).or_default();
-                        trace.insert(span.span_id.clone(), span);
+                        keep(span);
                     }
                 }
             }
         }
 
         // Hot spans are inserted last so they override compacted copies.
-        for span in self.db.get_namespace_spans(tenant_id, namespace).await? {
-            by_trace
-                .entry(span.trace_id.clone())
-                .or_default()
-                .insert(span.span_id.clone(), span);
+        for span in hot_spans {
+            keep(span);
         }
 
         let mut summaries: Vec<TraceSummary> = by_trace
@@ -128,6 +146,63 @@ impl TraceLakeReader {
         summaries.truncate(search.limit);
 
         Ok(summaries)
+    }
+
+    /// Trace ids matched by the text query, over compacted segments and the
+    /// hot store. `None` when the query has no text term.
+    async fn text_hits(
+        &self,
+        manifest: Option<&tracelake_core::SegmentManifest>,
+        hot_spans: &[Span],
+        search: &TraceSearch,
+    ) -> Result<Option<HashSet<String>>, QueryError> {
+        let Some(text_query) = &search.text_query else {
+            return Ok(None);
+        };
+
+        let mut hits = HashSet::new();
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                if !stats_may_overlap(&entry.stats, search) {
+                    continue;
+                }
+                hits.extend(
+                    self.search_segment_text(entry, text_query, search.limit)
+                        .await?,
+                );
+            }
+        }
+
+        hits.extend(search_hot_text(hot_spans, text_query, search.limit)?);
+
+        Ok(Some(hits))
+    }
+
+    async fn search_segment_text(
+        &self,
+        entry: &SegmentEntry,
+        text_query: &str,
+        limit: usize,
+    ) -> Result<HashSet<String>, QueryError> {
+        let text_file = entry
+            .files
+            .iter()
+            .find(|file| file.kind == SegmentFileKind::Text)
+            .ok_or(QueryError::MissingSegmentFile {
+                segment_id: entry.segment_id.clone(),
+                kind: SegmentFileKind::Text.extension(),
+            })?;
+
+        let bytes = self
+            .store
+            .get(&Path::from(text_file.path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+
+        Ok(search_text_index(&bytes, text_query, limit)?
+            .into_iter()
+            .collect())
     }
 
     /// Reads every trace of one segment pack. The pack is fetched and
@@ -160,6 +235,29 @@ impl TraceLakeReader {
 
         Ok(traces)
     }
+}
+
+/// Builds a throwaway index over the hot store so the newest spans are
+/// searchable before compaction. Hot data is memtable-sized, and compaction
+/// moves it into an indexed segment.
+fn search_hot_text(
+    hot_spans: &[Span],
+    text_query: &str,
+    limit: usize,
+) -> Result<HashSet<String>, QueryError> {
+    if hot_spans.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let traces: Vec<Trace> = group_spans(hot_spans.to_vec())
+        .into_iter()
+        .flat_map(|group| group.traces)
+        .collect();
+    let bytes = build_text_index(&traces)?;
+
+    Ok(search_text_index(&bytes, text_query, limit)?
+        .into_iter()
+        .collect())
 }
 
 /// Whether a segment's stats leave any possibility of a matching span for
@@ -608,6 +706,95 @@ mod tests {
                 Some(format!("failure in {}", summary.trace_id).as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn text_search_finds_compacted_traces_by_prompt_and_output() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut hallucination = make_span("trace-hallucination", "span-a", 1);
+        hallucination.input = Some(json!({ "prompt": "explain the refund policy" }));
+        hallucination.output = Some(json!({ "text": "the agent invented a 90 day window" }));
+
+        let mut refund = make_span("trace-refund", "span-a", 2);
+        refund.output = Some(json!({ "text": "refunds post within five business days" }));
+
+        compact_spans(&store, &[hallucination, refund]).await;
+
+        let db = TraceLakeDb::open_in_memory("/search-text")
+            .await
+            .expect("db should open");
+        let reader = TraceLakeReader::new(db, Arc::clone(&store), BASE_PATH);
+
+        let summaries = reader
+            .search_traces(
+                "tenantid-1",
+                "default",
+                &TraceSearch {
+                    text_query: Some("invented".to_string()),
+                    ..TraceSearch::default()
+                },
+            )
+            .await
+            .expect("text search should succeed");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].trace_id, "trace-hallucination");
+    }
+
+    #[tokio::test]
+    async fn text_search_covers_hot_spans_before_compaction() {
+        let mut hot = make_span("trace-hot", "span-a", 1);
+        hot.error = Some("tool timeout after 30s".to_string());
+        let reader = reader_with_hot(&[hot]).await;
+
+        let summaries = reader
+            .search_traces(
+                "tenantid-1",
+                "default",
+                &TraceSearch {
+                    text_query: Some("timeout".to_string()),
+                    ..TraceSearch::default()
+                },
+            )
+            .await
+            .expect("hot text search should succeed");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].trace_id, "trace-hot");
+    }
+
+    #[tokio::test]
+    async fn text_search_combines_with_structural_filters() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut failed = make_span("trace-failed", "span-a", 1);
+        failed.status = SpanStatus::Error;
+        failed.output = Some(json!({ "text": "hallucination in the answer" }));
+        let mut ok = make_span("trace-ok", "span-a", 2);
+        ok.output = Some(json!({ "text": "hallucination in the answer" }));
+
+        compact_spans(&store, &[failed, ok]).await;
+        let db = TraceLakeDb::open_in_memory("/search-text-filter")
+            .await
+            .expect("db should open");
+        let reader = TraceLakeReader::new(db, Arc::clone(&store), BASE_PATH);
+
+        let summaries = reader
+            .search_traces(
+                "tenantid-1",
+                "default",
+                &TraceSearch {
+                    text_query: Some("hallucination".to_string()),
+                    status: Some(SpanStatus::Error),
+                    ..TraceSearch::default()
+                },
+            )
+            .await
+            .expect("combined search should succeed");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].trace_id, "trace-failed");
     }
 
     #[tokio::test]

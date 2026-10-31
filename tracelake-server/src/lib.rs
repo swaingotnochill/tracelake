@@ -211,13 +211,29 @@ mod tests {
         assert_eq!(body[0]["trace_id"], "trace-1");
         assert_eq!(body[0]["error"], "model timeout");
 
-        // 5. Compact: spans move to a segment (hot copies remain; the gap
+        // 5. Text search before compaction uses the hot-store index.
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/traces/search",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "text_query": "timeout"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(body[0]["trace_id"], "trace-1");
+
+        // 6. Compact: spans move to a segment (hot copies remain; the gap
         // known from Step 4).
         let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["segments"], json!(["segment-000001"]));
 
-        // 6. Fetch after compaction: hot + segment merge must dedup to the
+        // 7. Fetch after compaction: hot + segment merge must dedup to the
         // same trace.
         let (status, body) = call(
             app.clone(),
@@ -229,7 +245,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["spans"].as_array().map(Vec::len), Some(2));
 
-        // 7. Search after compaction: same answer through the merge path.
+        // 8. Search after compaction: same answer through the merge path.
         let (status, body) = call(
             app.clone(),
             "POST",
@@ -244,6 +260,22 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().map(Vec::len), Some(1));
         assert_eq!(body[0]["span_count"], 2);
+
+        // 9. Text search after compaction reads the segment index.
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/traces/search",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "text_query": "timeout"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(body[0]["trace_id"], "trace-1");
     }
 
     #[tokio::test]
@@ -462,7 +494,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        let (status, _) = call(
+        let (status, failure) = call(
             app.clone(),
             "PUT",
             "/v1/tables/tenantid-1/default/findings/schema",
@@ -477,6 +509,134 @@ mod tests {
             })),
         )
         .await;
+        assert_eq!(
+            failure["error"],
+            "field 'severity' changed type from string to i64"
+        );
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn an_evolved_schema_reads_segments_written_under_the_old_one() {
+        let app = build_router(test_state().await);
+
+        let v1 = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "severity", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-1", "severity": "high" }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let v2 = json!({
+            "version": 2,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "severity", "field_type": "string", "required": true },
+                { "name": "confidence", "field_type": "f64", "required": false },
+                {
+                    "name": "source",
+                    "field_type": "string",
+                    "required": true,
+                    "default": "manual"
+                }
+            ]
+        });
+        let (status, body) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v2),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["version"], 2);
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/default/findings/records/f-1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "manual");
+        assert!(body.get("confidence").is_none());
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [
+                { "finding_id": "f-2", "severity": "high", "confidence": 0.9, "source": "scanner" }
+            ] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({
+                "filter": { "ge": { "field": "confidence", "value": 0.5 } },
+                "projection": ["severity", "confidence", "source"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["records"][0]["finding_id"], "f-2");
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({
+                "filter": { "eq": { "field": "source", "value": "manual" } }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["records"][0]["finding_id"], "f-1");
+        assert_eq!(body["records"][0]["source"], "manual");
+
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({ "limit": 10 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(2));
     }
 }

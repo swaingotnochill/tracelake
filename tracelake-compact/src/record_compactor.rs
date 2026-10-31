@@ -94,7 +94,7 @@ impl RecordCompactor {
     }
 
     async fn compact_group(&self, group: &RecordGroup) -> Result<SegmentEntry, CompactError> {
-        put_schema(
+        let schema = put_schema(
             &self.store,
             &self.base_path,
             &group.tenant_id,
@@ -121,7 +121,7 @@ impl RecordCompactor {
                 group,
                 &segment_id,
                 SegmentFileKind::RecordPack,
-                encode_record_pack(&group.schema, &group.records)?,
+                encode_record_pack(&schema, &group.records)?,
             )
             .await?;
         let bloom_file = self
@@ -129,11 +129,11 @@ impl RecordCompactor {
                 group,
                 &segment_id,
                 SegmentFileKind::Bloom,
-                build_record_bloom(&group.schema, &group.records)?,
+                build_record_bloom(&schema, &group.records)?,
             )
             .await?;
 
-        let record_stats = build_record_stats(&group.schema, &group.records)?;
+        let record_stats = build_record_stats(&schema, &group.records)?;
         let stats_file = self
             .put_file(
                 group,

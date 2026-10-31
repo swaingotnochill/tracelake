@@ -30,6 +30,9 @@ pub enum QueryError {
     #[error("record pack decode failed: {0}")]
     RecordPack(#[from] tracelake_core::RecordPackError),
 
+    #[error("text index failed: {0}")]
+    Text(#[from] tracelake_compact::TextIndexError),
+
     #[error("bloom filter decode failed: {0}")]
     Bloom(#[from] tracelake_core::BloomError),
 

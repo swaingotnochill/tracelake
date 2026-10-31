@@ -1,7 +1,8 @@
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 use tracelake_core::{
-    FieldType, Record, RecordPackError, TableSchema, decode_record_pack, encode_record_pack,
+    FieldDef, FieldType, Record, RecordPackError, TableSchema, decode_record_pack,
+    encode_record_pack,
 };
 
 const FIELD_ALPHABET: &[char] = &['a', 'b', 'c', '0', '1', '-'];
@@ -208,20 +209,66 @@ proptest! {
     }
 
     #[test]
-    fn packs_written_under_one_schema_refuse_another((table, records) in schema_and_records()) {
-        let other = TableSchema::builder("prop_table")
-            .field("id", FieldType::String)
-            .primary_key("id")
-            .build()
-            .expect("foreign schema builds");
+    fn an_older_pack_reads_under_a_newer_schema_that_adds_a_field(
+        (table, records) in schema_and_records()
+    ) {
+        let bytes = encode_record_pack(&table, &records).expect("valid records encode");
+        let pack = decode_record_pack(&bytes).expect("encoded packs decode");
+
+        let mut extended = table.clone();
+        extended.fields.push(FieldDef {
+            name: "added".to_string(),
+            field_type: FieldType::String,
+            required: false,
+            default: None,
+        });
+        table.evolve(&extended).expect("adding an optional field evolves");
+
+        for record in &records {
+            let record_id = table.record_id(record).expect("id derives");
+            let decoded = pack
+                .read_record(&extended, &record_id)
+                .expect("lookup succeeds")
+                .expect("record is present");
+            prop_assert!(decoded.get("added").is_none());
+        }
+    }
+
+    #[test]
+    fn a_type_change_errors_only_when_the_changed_field_is_requested(
+        (table, records) in schema_and_records()
+    ) {
+        let Some(target) = table
+            .fields
+            .iter()
+            .find(|field| field.field_type != FieldType::Json && field.name != table.primary_key)
+            .cloned()
+        else {
+            return Ok(());
+        };
 
         let bytes = encode_record_pack(&table, &records).expect("valid records encode");
         let pack = decode_record_pack(&bytes).expect("encoded packs decode");
 
-        let rejected = matches!(
-            pack.scan(&other, &["id"]),
-            Err(RecordPackError::SchemaMismatch { .. })
-        );
-        prop_assert!(rejected, "a foreign schema must be refused");
+        let mut retyped = table.clone();
+        for field in &mut retyped.fields {
+            if field.name == target.name {
+                field.field_type = if target.field_type == FieldType::I64 {
+                    FieldType::String
+                } else {
+                    FieldType::I64
+                };
+            }
+        }
+
+        for record in &records {
+            if record.get(&target.name).is_none() {
+                continue;
+            }
+            let record_id = table.record_id(record).expect("id derives");
+            let mismatch = pack.read_record_with(&retyped, &record_id, &[&target.name]);
+            let is_mismatch = matches!(mismatch, Err(RecordPackError::FieldTypeMismatch { .. }));
+            prop_assert!(is_mismatch);
+        }
     }
 }

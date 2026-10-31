@@ -51,6 +51,7 @@ pub enum SegmentFileKind {
     RecordPack,
     Bloom,
     Stats,
+    Text,
 }
 
 impl SegmentFileKind {
@@ -61,6 +62,7 @@ impl SegmentFileKind {
             SegmentFileKind::RecordPack => "recordpack",
             SegmentFileKind::Bloom => "bloom",
             SegmentFileKind::Stats => "stats",
+            SegmentFileKind::Text => "text",
         }
     }
 }
@@ -98,14 +100,18 @@ pub struct SegmentStats {
 /// overlap these bounds, so it never reads the pack.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecordStats {
-    pub schema_fingerprint: u64,
+    /// Registry version the segment was written under.
+    #[serde(default)]
+    pub schema_version: u32,
     pub record_count: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, FieldRange>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldRange {
+    /// Type the bounds were computed from. Bounds never prune across a type.
+    pub field_type: crate::schema::FieldType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i64_min: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +129,21 @@ pub struct FieldRange {
     /// low-cardinality fields queries filter on (task, model, status).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinct: Option<Vec<String>>,
+}
+
+impl FieldRange {
+    pub fn new(field_type: crate::schema::FieldType) -> Self {
+        Self {
+            field_type,
+            i64_min: None,
+            i64_max: None,
+            f64_min: None,
+            f64_max: None,
+            string_min: None,
+            string_max: None,
+            distinct: None,
+        }
+    }
 }
 
 /// Distinct-value lists beyond this size cost more to store than the pack read
@@ -229,15 +250,16 @@ mod tests {
     fn table_manifest_round_trips_with_record_stats() {
         let mut entry = example_entry("segment-000001");
         entry.record_stats = Some(RecordStats {
-            schema_fingerprint: 0xabc,
+            schema_version: 3,
             record_count: 2,
             fields: BTreeMap::from([(
                 "score".to_string(),
                 FieldRange {
+                    field_type: crate::schema::FieldType::F64,
                     f64_min: Some(0.25),
                     f64_max: Some(0.75),
                     distinct: Some(vec!["gsm8k".to_string()]),
-                    ..FieldRange::default()
+                    ..FieldRange::new(crate::schema::FieldType::F64)
                 },
             )]),
         });
@@ -262,7 +284,7 @@ mod tests {
 
         let value = serde_json::to_value(stats).expect("stats should encode");
         assert!(value.get("fields").is_none());
-        assert!(value.get("schema_fingerprint").is_some());
+        assert!(value.get("schema_version").is_some());
     }
 
     #[test]

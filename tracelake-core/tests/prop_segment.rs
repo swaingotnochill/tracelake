@@ -4,8 +4,8 @@
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use tracelake_core::{
-    FieldRange, RecordStats, SegmentEntry, SegmentFile, SegmentFileKind, SegmentManifest,
-    SegmentStats, segment_id,
+    FieldRange, FieldType, RecordStats, SegmentEntry, SegmentFile, SegmentFileKind,
+    SegmentManifest, SegmentStats, segment_id,
 };
 
 /// Fixed epoch (mid-2026); deltas stay inside RFC3339-safe nanosecond range.
@@ -114,30 +114,44 @@ fn entry_id() -> impl Strategy<Value = String> {
     ]
 }
 
+fn field_type() -> impl Strategy<Value = FieldType> {
+    prop_oneof![
+        Just(FieldType::String),
+        Just(FieldType::I64),
+        Just(FieldType::F64),
+        Just(FieldType::Bool),
+        Just(FieldType::Json),
+        Just(FieldType::Timestamp),
+    ]
+}
+
 fn field_range() -> impl Strategy<Value = FieldRange> {
     (
+        field_type(),
         prop::option::of(any::<i64>()),
         prop::option::of(0.0f64..1_000.0),
         prop::option::of(small_string()),
         prop::option::of(prop::collection::vec(small_string(), 0..=4)),
     )
-        .prop_map(|(i64_min, f64_max, string_min, distinct)| FieldRange {
-            i64_min,
-            f64_max,
-            string_min,
-            distinct,
-            ..FieldRange::default()
-        })
+        .prop_map(
+            |(field_type, i64_min, f64_max, string_min, distinct)| FieldRange {
+                i64_min,
+                f64_max,
+                string_min,
+                distinct,
+                ..FieldRange::new(field_type)
+            },
+        )
 }
 
 fn record_stats() -> impl Strategy<Value = RecordStats> {
     (
-        any::<u64>(),
+        any::<u32>(),
         0u64..=100_000,
         prop::collection::vec((small_string(), field_range()), 0..=3),
     )
-        .prop_map(|(schema_fingerprint, record_count, fields)| RecordStats {
-            schema_fingerprint,
+        .prop_map(|(schema_version, record_count, fields)| RecordStats {
+            schema_version,
             record_count,
             fields: fields.into_iter().collect(),
         })

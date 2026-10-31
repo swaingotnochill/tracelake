@@ -27,11 +27,14 @@ pub enum CompactError {
     #[error("schema shape is invalid: {0}")]
     Schema(#[from] tracelake_core::SchemaError),
 
+    #[error("schema cannot evolve: {0}")]
+    Evolution(#[from] tracelake_core::EvolutionError),
+
+    #[error("text index failed: {0}")]
+    Text(#[from] crate::text_indexer::TextIndexError),
+
     #[error("table '{table}' has no registered schema")]
     SchemaNotFound { table: String },
-
-    #[error("table '{table}' already has a different registered schema")]
-    SchemaConflict { table: String },
 
     #[error("segment {segment_id} lists no record pack")]
     MissingRecordPack { segment_id: String },
@@ -170,6 +173,15 @@ impl Compactor {
             )
             .await?;
 
+        let text_file = self
+            .put_file(
+                group,
+                &segment_id,
+                SegmentFileKind::Text,
+                crate::text_indexer::build_text_index(&group.traces)?,
+            )
+            .await?;
+
         let stats = build_segment_stats(group);
         let stats_file = self
             .put_file(
@@ -184,7 +196,7 @@ impl Compactor {
             segment_id: segment_id.clone(),
             trace_count: stats.trace_count,
             span_count: stats.span_count,
-            files: vec![pack_file, bloom_file, stats_file],
+            files: vec![pack_file, bloom_file, stats_file, text_file],
             stats,
             record_stats: None,
         };
@@ -417,7 +429,7 @@ mod tests {
         assert_eq!(entry.segment_id, "segment-000001");
         assert_eq!(entry.trace_count, TRACE_COUNT as u64);
         assert_eq!(entry.span_count, SPAN_COUNT as u64);
-        assert_eq!(entry.files.len(), 3);
+        assert_eq!(entry.files.len(), 4);
 
         let kinds: Vec<_> = entry
             .files

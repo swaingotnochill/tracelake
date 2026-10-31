@@ -1,6 +1,8 @@
 use proptest::prelude::*;
 use serde_json::{Value, json};
-use tracelake_core::{FieldDef, FieldType, Record, RecordError, SchemaError, TableSchema};
+use tracelake_core::{
+    EvolutionError, FieldDef, FieldType, Record, RecordError, SchemaError, TableSchema,
+};
 
 const NAME_ALPHABET: &[char] = &['a', 'b', 'c', '0', '1'];
 
@@ -57,6 +59,7 @@ fn fields() -> impl Strategy<Value = Vec<FieldDef>> {
                 name,
                 field_type,
                 required,
+                default: None,
             });
         }
 
@@ -67,10 +70,14 @@ fn fields() -> impl Strategy<Value = Vec<FieldDef>> {
 fn schema_from(declared: &[FieldDef]) -> TableSchema {
     let mut builder = TableSchema::builder("prop").field("id", FieldType::String);
     for field in declared {
-        builder = if field.required {
-            builder.required_field(field.name.clone(), field.field_type)
-        } else {
-            builder.field(field.name.clone(), field.field_type)
+        builder = match (&field.default, field.required) {
+            (Some(default), _) => builder.required_field_with_default(
+                field.name.clone(),
+                field.field_type,
+                default.clone(),
+            ),
+            (None, true) => builder.required_field(field.name.clone(), field.field_type),
+            (None, false) => builder.field(field.name.clone(), field.field_type),
         };
     }
 
@@ -166,6 +173,7 @@ proptest! {
             name: "extra".to_string(),
             field_type: FieldType::String,
             required: extra_required,
+            default: None,
         });
         prop_assert_ne!(base.fingerprint(), schema_from(&extended).fingerprint());
     }
@@ -185,5 +193,104 @@ proptest! {
                 name: "missing".to_string()
             })
         );
+    }
+
+    #[test]
+    fn adding_an_optional_field_always_evolves(declared in fields()) {
+        let base = schema_from(&declared);
+        let mut extended = declared.clone();
+        extended.push(FieldDef {
+            name: "added".to_string(),
+            field_type: FieldType::String,
+            required: false,
+            default: None,
+        });
+
+        prop_assert_eq!(base.evolve(&schema_from(&extended)), Ok(()));
+        prop_assert!(!base.same_shape(&schema_from(&extended)));
+        prop_assert!(base.same_shape(&schema_from(&declared)));
+    }
+
+    #[test]
+    fn a_type_change_is_always_refused(declared in fields()) {
+        let Some(target) = declared
+            .iter()
+            .find(|field| field.name != "id")
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        let base = schema_from(&declared);
+        let mut changed = declared.clone();
+        for field in &mut changed {
+            if field.name == target.name {
+                field.field_type = if target.field_type == FieldType::Json {
+                    FieldType::String
+                } else {
+                    FieldType::Json
+                };
+            }
+        }
+
+        let refused = matches!(
+            base.evolve(&schema_from(&changed)),
+            Err(EvolutionError::TypeChanged { .. })
+        );
+        prop_assert!(refused);
+    }
+
+    #[test]
+    fn adding_a_required_field_evolves_only_with_a_default(declared in fields()) {
+        let base = schema_from(&declared);
+        let mut without_default = declared.clone();
+        without_default.push(FieldDef {
+            name: "required_added".to_string(),
+            field_type: FieldType::String,
+            required: true,
+            default: None,
+        });
+        prop_assert_eq!(
+            base.evolve(&schema_from(&without_default)),
+            Err(EvolutionError::RequiredWithoutDefault {
+                name: "required_added".to_string()
+            })
+        );
+
+        let mut with_default = declared.clone();
+        with_default.push(FieldDef {
+            name: "required_added".to_string(),
+            field_type: FieldType::String,
+            required: true,
+            default: Some(json!("fallback")),
+        });
+        prop_assert_eq!(base.evolve(&schema_from(&with_default)), Ok(()));
+    }
+
+    #[test]
+    fn fill_defaults_fills_absent_and_null_values_only(declared in fields()) {
+        let mut schema = schema_from(&declared);
+        schema.fields.push(FieldDef {
+            name: "with_default".to_string(),
+            field_type: FieldType::String,
+            required: true,
+            default: Some(json!("fallback")),
+        });
+
+        let mut record = Record::new().set("id", json!("record-1"));
+        schema.fill_defaults(&mut record);
+        prop_assert_eq!(record.get("with_default"), Some(&json!("fallback")));
+
+        let mut explicit = Record::new()
+            .set("id", json!("record-2"))
+            .set("with_default", json!("kept"));
+        schema.fill_defaults(&mut explicit);
+        prop_assert_eq!(explicit.get("with_default"), Some(&json!("kept")));
+
+        let mut nulled = Record::new()
+            .set("id", json!("record-3"))
+            .set("with_default", serde_json::Value::Null);
+        schema.fill_defaults(&mut nulled);
+        prop_assert_eq!(nulled.get("with_default"), Some(&json!("fallback")));
     }
 }

@@ -16,6 +16,30 @@ pub enum FieldType {
 }
 
 impl FieldType {
+    /// One-byte tag stored in a record pack. Tags are part of the pack format.
+    pub fn tag(self) -> u8 {
+        match self {
+            FieldType::String => 0,
+            FieldType::I64 => 1,
+            FieldType::F64 => 2,
+            FieldType::Bool => 3,
+            FieldType::Json => 4,
+            FieldType::Timestamp => 5,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<FieldType> {
+        match tag {
+            0 => Some(FieldType::String),
+            1 => Some(FieldType::I64),
+            2 => Some(FieldType::F64),
+            3 => Some(FieldType::Bool),
+            4 => Some(FieldType::Json),
+            5 => Some(FieldType::Timestamp),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             FieldType::String => "string",
@@ -28,15 +52,18 @@ impl FieldType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,
     /// False means the field may be absent or null.
     pub required: bool,
+    /// Substituted when a record, or an older pack, does not carry the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub version: u32,
     pub table: String,
@@ -69,6 +96,23 @@ pub enum SchemaError {
 
     #[error("schema version {version} is not supported")]
     UnsupportedVersion { version: u32 },
+}
+
+/// Why a schema cannot replace the registered one.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EvolutionError {
+    #[error("primary key changed from '{from}' to '{to}'")]
+    PrimaryKeyChanged { from: String, to: String },
+
+    #[error("field '{name}' changed type from {from} to {to}")]
+    TypeChanged {
+        name: String,
+        from: &'static str,
+        to: &'static str,
+    },
+
+    #[error("new required field '{name}' has no default, so earlier records cannot satisfy it")]
+    RequiredWithoutDefault { name: String },
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -140,7 +184,7 @@ impl TableSchema {
 
         for field in &self.fields {
             match record.fields.get(&field.name) {
-                None | Some(Value::Null) if field.required => {
+                None | Some(Value::Null) if field.required && field.default.is_none() => {
                     return Err(RecordError::MissingRequiredField {
                         name: field.name.clone(),
                     });
@@ -173,8 +217,68 @@ impl TableSchema {
         records.iter().try_for_each(|record| self.validate(record))
     }
 
+    /// Fills declared defaults for fields the record does not hold. Applies to
+    /// hot records and to packs written before the field existed.
+    pub fn fill_defaults(&self, record: &mut Record) {
+        for field in &self.fields {
+            let Some(default) = &field.default else {
+                continue;
+            };
+            match record.fields.get(&field.name) {
+                None | Some(Value::Null) => {
+                    record.fields.insert(field.name.clone(), default.clone());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    pub fn same_shape(&self, other: &TableSchema) -> bool {
+        self.table == other.table
+            && self.primary_key == other.primary_key
+            && self.fields == other.fields
+    }
+
+    /// Whether `next` may replace `self` without rewriting stored segments.
+    ///
+    /// Adding an optional field is safe. Adding a required field is safe only
+    /// with a default that older records read as. Dropping a field hides its
+    /// values but leaves them in older packs. Changing a type is refused.
+    pub fn evolve(&self, next: &TableSchema) -> Result<(), EvolutionError> {
+        if self.primary_key != next.primary_key {
+            return Err(EvolutionError::PrimaryKeyChanged {
+                from: self.primary_key.clone(),
+                to: next.primary_key.clone(),
+            });
+        }
+
+        for field in &self.fields {
+            let Some(replacement) = next.field(&field.name) else {
+                continue;
+            };
+            if replacement.field_type != field.field_type {
+                return Err(EvolutionError::TypeChanged {
+                    name: field.name.clone(),
+                    from: field.field_type.as_str(),
+                    to: replacement.field_type.as_str(),
+                });
+            }
+        }
+
+        for field in &next.fields {
+            let added = self.field(&field.name).is_none();
+            if added && field.required && field.default.is_none() {
+                return Err(EvolutionError::RequiredWithoutDefault {
+                    name: field.name.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn validate_shape(&self) -> Result<(), SchemaError> {
-        if self.version != SCHEMA_VERSION {
+        if self.version == 0 {
             return Err(SchemaError::UnsupportedVersion {
                 version: self.version,
             });
@@ -224,6 +328,22 @@ impl SchemaBuilder {
         self
     }
 
+    /// A required field that older records and packs may omit, in which case
+    /// `default` stands in for it. This is the only way to add a required field
+    /// to a table that already holds data.
+    pub fn required_field_with_default(
+        mut self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        default: Value,
+    ) -> Self {
+        self.push(name.into(), field_type, true);
+        if let Some(field) = self.fields.last_mut() {
+            field.default = Some(default);
+        }
+        self
+    }
+
     pub fn primary_key(mut self, name: impl Into<String>) -> Self {
         self.primary_key = Some(name.into());
         self
@@ -248,6 +368,7 @@ impl SchemaBuilder {
             name,
             field_type,
             required,
+            default: None,
         });
     }
 }
@@ -561,6 +682,7 @@ mod tests {
                 name: "f".to_string(),
                 field_type,
                 required: false,
+                default: None,
             };
             let high = typed_value(&field, &high).expect("high value types");
             let low = typed_value(&field, &low).expect("low value types");
@@ -578,6 +700,7 @@ mod tests {
             name: "f".to_string(),
             field_type: FieldType::Bool,
             required: false,
+            default: None,
         };
         let yes = typed_value(&bool_field, &json!(true)).unwrap();
         let no = typed_value(&bool_field, &json!(false)).unwrap();
@@ -589,6 +712,7 @@ mod tests {
             name: "f".to_string(),
             field_type: FieldType::Json,
             required: false,
+            default: None,
         };
         let first = json!({ "a": [1, 2] });
         let second = json!({ "a": [1, 2] });

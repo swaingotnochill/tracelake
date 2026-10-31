@@ -11,13 +11,13 @@ pub fn build_record_stats(
     records: &[Record],
 ) -> Result<RecordStats, RecordError> {
     let mut stats = RecordStats {
-        schema_fingerprint: schema.fingerprint(),
+        schema_version: schema.version,
         record_count: records.len() as u64,
         fields: BTreeMap::new(),
     };
 
     for field in &schema.fields {
-        let mut range = FieldRange::default();
+        let mut range = FieldRange::new(field.field_type);
         let mut distinct: Option<Vec<String>> = Some(Vec::new());
 
         for record in records {
@@ -120,7 +120,7 @@ mod tests {
         let stats = build_record_stats(&sample_schema(), &records).unwrap();
 
         assert_eq!(stats.record_count, 3);
-        assert_eq!(stats.schema_fingerprint, sample_schema().fingerprint());
+        assert_eq!(stats.schema_version, sample_schema().version);
 
         let task = &stats.fields["task"];
         assert_eq!(task.string_min.as_deref(), Some("gsm8k"));
@@ -154,8 +154,8 @@ mod tests {
 
         let stats = build_record_stats(&sample_schema(), &records).unwrap();
 
-        assert_eq!(stats.fields["score"], FieldRange::default());
-        assert_eq!(stats.fields["task"], FieldRange::default());
+        assert_eq!(stats.fields["score"], FieldRange::new(FieldType::F64));
+        assert_eq!(stats.fields["task"], FieldRange::new(FieldType::String));
     }
 
     #[test]

@@ -173,11 +173,12 @@ impl TraceLakeReader {
             }
         }
 
-        if let Some(hot) = self
+        if let Some(mut hot) = self
             .db
             .get_record(tenant_id, namespace, &schema, record_id)
             .await?
         {
+            schema.fill_defaults(&mut hot);
             found = Some(hot);
         }
 
@@ -230,11 +231,12 @@ impl TraceLakeReader {
             }
         }
 
-        for record in self
+        for mut record in self
             .db
             .get_table_records(tenant_id, namespace, table)
             .await?
         {
+            schema.fill_defaults(&mut record);
             let record_id = schema.record_id(&record)?;
             by_id.insert(record_id, record);
         }
