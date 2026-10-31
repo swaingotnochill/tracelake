@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use tracelake_compact::Compactor;
+use tracelake_compact::{Compactor, RecordCompactor};
 use tracelake_core::Span;
 use tracelake_ingest::IngestError;
 
@@ -60,12 +60,24 @@ pub async fn post_compact(
         .await
         .map_err(|error| error_response(&error))?;
 
+    let record_entries = RecordCompactor::new(Arc::clone(&state.store), state.base_path.clone())
+        .compact(&state.db)
+        .await
+        .map_err(|error| error_response(&error))?;
+
     let segments: Vec<&str> = entries
         .iter()
         .map(|entry| entry.segment_id.as_str())
         .collect();
+    let record_segments: Vec<&str> = record_entries
+        .iter()
+        .map(|entry| entry.segment_id.as_str())
+        .collect();
 
-    Ok((StatusCode::OK, Json(json!({ "segments": segments }))))
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "segments": segments, "record_segments": record_segments })),
+    ))
 }
 
 /// Maps ingest failures to status codes: invalid spans are client errors,

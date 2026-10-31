@@ -2,6 +2,7 @@
 
 pub mod ingest_handler;
 pub mod query_handler;
+pub mod table_handler;
 
 use slatedb::object_store::ObjectStore;
 use std::sync::Arc;
@@ -49,6 +50,24 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/v1/traces/search",
             axum::routing::post(query_handler::post_search),
         )
+        .route(
+            "/v1/tables/{tenant_id}/{namespace}/{table}/schema",
+            axum::routing::put(table_handler::put_table_schema)
+                .get(table_handler::get_table_schema),
+        )
+        .route(
+            "/v1/tables/{tenant_id}/{namespace}/{table}/records",
+            axum::routing::post(table_handler::post_records),
+        )
+        .route(
+            "/v1/tables/{tenant_id}/{namespace}/{table}/records/{record_id}",
+            axum::routing::get(table_handler::get_record),
+        )
+        .route(
+            "/v1/tables/{tenant_id}/{namespace}/{table}/query",
+            axum::routing::post(table_handler::post_record_query),
+        )
+        .route("/v1/evals", axum::routing::post(table_handler::post_evals))
         .with_state(state)
 }
 
@@ -258,5 +277,206 @@ mod tests {
 
         let response = app.oneshot(request).await.expect("request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn eval_log_fixture() -> Value {
+        json!({
+            "eval": {
+                "eval_id": "eval-1",
+                "task": "gsm8k",
+                "model": "openai/gpt-4o",
+                "status": "success"
+            },
+            "samples": [
+                {
+                    "id": "1",
+                    "epoch": 1,
+                    "input": "What is 2 + 2?",
+                    "target": "4",
+                    "output": { "completion": "4" },
+                    "scores": { "accuracy": { "value": 1.0 } },
+                    "metadata": { "trace_id": "trace-1" },
+                    "model_usage": { "openai/gpt-4o": { "total_tokens": 15 } },
+                    "total_time": 1.5,
+                    "completed_at": "2026-10-01T12:00:02+00:00"
+                },
+                {
+                    "id": "2",
+                    "epoch": 1,
+                    "input": "What is 9 * 9?",
+                    "target": "81",
+                    "scores": { "accuracy": { "value": 0.0 } },
+                    "error": "model timeout"
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn eval_logs_are_stored_and_queried_through_custom_schemas() {
+        let app = build_router(test_state().await);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/evals",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "evals",
+                "log": eval_log_fixture()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["written"], 2);
+        assert_eq!(body["table"], "inspect_ai_samples");
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/evals/inspect_ai_samples/schema",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["primary_key"], "sample_id");
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/evals/inspect_ai_samples/query",
+            Some(json!({
+                "filter": { "ge": { "field": "score", "value": 0.5 } },
+                "projection": ["task", "score", "trace_id"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["records"][0]["sample_id"], "1@1");
+        assert_eq!(body["records"][0]["score"], 1.0);
+        assert_eq!(body["records"][0]["trace_id"], "trace-1");
+        assert!(body["records"][0].get("input").is_none());
+
+        let (status, body) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["record_segments"], json!(["segment-000001"]));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/evals/inspect_ai_samples/query",
+            Some(json!({
+                "filter": { "eq": { "field": "task", "value": "gsm8k" } },
+                "projection": ["score"],
+                "limit": 10
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["scanned_segments"], 1);
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/evals/inspect_ai_samples/records/2@1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["error"], "model timeout");
+    }
+
+    #[tokio::test]
+    async fn custom_tables_accept_records_only_after_schema_registration() {
+        let app = build_router(test_state().await);
+        let schema = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "severity", "field_type": "string", "required": true },
+                { "name": "confidence", "field_type": "f64", "required": false }
+            ]
+        });
+        let records = json!({
+            "records": [
+                { "finding_id": "f-1", "severity": "high", "confidence": 0.9 },
+                { "finding_id": "f-2", "severity": "low", "confidence": 0.2 }
+            ]
+        });
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(records.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(schema.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(records),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["written"], 2);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({
+                "filter": { "and": [
+                    { "eq": { "field": "severity", "value": "high" } },
+                    { "gt": { "field": "confidence", "value": 0.5 } }
+                ]}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["records"][0]["finding_id"], "f-1");
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-3", "severity": "high", "nope": 1 }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(json!({
+                "version": 1,
+                "table": "findings",
+                "primary_key": "finding_id",
+                "fields": [
+                    { "name": "finding_id", "field_type": "string", "required": true },
+                    { "name": "severity", "field_type": "i64", "required": true }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 }
