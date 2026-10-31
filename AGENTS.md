@@ -152,6 +152,7 @@ tracelake/
       schema_store.rs           # registers and loads table schemas
       record_compactor.rs       # builds record segments per table
       record_stats_writer.rs    # per-field bounds for record pruning
+      text_indexer.rs           # Tantivy index build, storage, and search
 
   tracelake-query/              # query engine
     src/
@@ -319,10 +320,15 @@ and separates warm-cache, cold-cache, ingest, search, hydration, and freshness r
 ### Step 11: Custom Table Schemas and Eval Storage
 
 Users define typed tables. Each table registers one schema per (tenant, namespace),
-validated on construction and again on load. Records are validated at the ingest boundary,
-stored in the hot store under a record key family, compacted into typed record packs with
-per-field stats, and queried with typed filters, projection, and segment pruning. Eval
-runs from inspect-ai are stored as ordinary rows of the `inspect_ai_samples` table.
+validated on construction and again on load. A compatible change becomes the next schema
+version; record packs carry their own field descriptors, so older segments keep decoding.
+Records are validated at the ingest boundary, stored in the hot store under a record key
+family, compacted into typed record packs with per-field stats, and queried with typed
+filters, projection, and segment pruning. Eval runs from inspect-ai are stored as ordinary
+rows of the `inspect_ai_samples` table.
+
+This step also implements Step 7: compaction builds a Tantivy index over span name, input,
+output, and error, and `search_traces` accepts `text_query`.
 
 Reference: [docs/schemas.md](docs/schemas.md). Decision trail:
 [docs/research/adr-custom-schemas.md](docs/research/adr-custom-schemas.md).

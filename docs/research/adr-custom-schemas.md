@@ -37,8 +37,8 @@ eval log.
 - Hot records live at `v1/r/t/{tenant}/ns/{namespace}/tb/{table}/r/{record_id}` as JSON.
   Span keys start with `v1/t/`, so the two key families cannot read each other's values.
 - Compaction writes one `TRCREC01` pack per table segment, a bloom filter over record ids,
-  per-field stats, and the table manifest. The pack carries the schema fingerprint, so a
-  pack written under another shape fails to decode instead of returning wrong values.
+  per-field stats, and the table manifest. The pack carries its own field descriptors, so
+  a pack written under an older shape stays readable after the schema evolves.
 - `RecordQuery` carries one filter tree, a projection, and a limit. `RecordQuery::validate`
   checks fields and value types once before any segment read. Segment pruning compares the
   filter against per-field min and max and against up to 64 distinct string values.
@@ -51,8 +51,8 @@ eval log.
   attributes, and segment bounds became data in the manifest instead of extra branches in
   the search path.
 - **Type system discipline.** Removing `Record.record_id` deleted a state that could
-  disagree with the primary key. The schema fingerprint in the pack turns a schema
-  mismatch into an error instead of a wrong decode.
+  disagree with the primary key. Per-pack field descriptors make a type mismatch an error
+  only when the mismatched field is read, instead of a whole-segment failure.
 - **Boundary discipline.** Validation sits at the two write boundaries and in
   `RecordQuery::validate`. The query and merge code trusts the schema.
 - **Fix root causes.** The pack reader dropped the 4-byte length prefix on strings and
@@ -137,11 +137,45 @@ cargo kani -p tracelake-core --harness restamped_corruptions_never_panic_in_deco
    account funds". The cause was model ids for providers this host does not configure.
    `pstack-models.md` now names only `openrouter/deepseek/deepseek-v4.1-flash-1017`.
 
+## Revision: schema evolution
+
+The first version registered one immutable shape per table. That was too strict. The
+systems this one is measured against do not work that way. turbopuffer infers attribute
+types per namespace and lets a namespace hold sparse attributes. LanceDB applies add,
+alter, and drop column operations without rewriting all data. Brainstore keeps indexes
+and metadata per segment and treats semi-structured data as a first-class citizen rather
+than shredding it into a fixed schema.
+
+The shape now is schema-on-read with compatibility rules:
+
+- A record pack stores its own field names and types. A reader maps by name, skips fields
+  the current schema dropped, and fills declared defaults for fields the pack predates.
+- `TableSchema::evolve` allows adding optional fields, adding required fields with a
+  default, and dropping fields. It refuses type changes and primary-key changes.
+- The registry assigns versions. Old segments are never rewritten.
+- Per-field stats carry the type they were computed from, so pruning never compares
+  bounds across a type change.
+
+The immutable rule cost one recorded bug. Hot records bypassed pack default substitution,
+so a record written before a defaulted field existed read back without the default when
+the hot copy won the merge. `TableSchema::fill_defaults` now runs at the merge boundary
+for hot records, and the end-to-end test writes a record, compacts, evolves, and reads the
+default back.
+
+Still refused: changing a field's type. A pack written as `string` cannot be read as
+`i64` without guessing, so the rule is a new table name and a rewrite. That is a
+deliberate limit, not an oversight.
+
+## Full-text search (Step 7)
+
+Compaction now builds a Tantivy index over span name, input, output, and error and stores
+it as the segment `.text` file. `TraceSearch.text_query` runs the index per segment, then
+applies the structural filters. Spans in the hot store are indexed per query into a
+throwaway index, so recent data is searchable before compaction. The cost of that choice
+is documented in `docs/schemas.md`.
+
 ## Open questions
 
-- Schema evolution. Adding a nullable field changes the fingerprint and makes old packs
-  refuse to decode. The options are a superset rule for fingerprints or a rewrite during
-  compaction.
 - Pruning and hot-store garbage collection. Today the hot store keeps the newest copy of
   every record, so pruning cannot surface a stale version. If SlateDB starts dropping
   compacted hot data, a pruned segment could return an old version while a newer one sits
@@ -155,4 +189,5 @@ cargo kani -p tracelake-core --harness restamped_corruptions_never_panic_in_deco
 
 ## Next step
 
-Define the schema evolution rule, because it gates every future table change.
+Aggregation over record packs, so per-scorer counts and percentiles do not require a scan
+in the client.

@@ -55,12 +55,14 @@ catches that. That is the boundary, stated plainly.
 | compact writers (bloom/stats/manifest/pack) | INTEGRATION | byte-exact segment round-trips | `compactor.rs` tests |
 | ingest `TraceLakeDb` | INTEGRATION | write/read/isolation/100K | `db.rs` tests |
 | `schema::TableSchema::validate` / `record_id` / `fingerprint` / `validate_shape` | PROPERTY | generated shapes: a record built from its schema validates, a dropped required field, an undeclared field, and a wrong-typed value are each reported; fingerprint is stable for one shape and changes with the shape; a loaded shape without its primary key is refused | `tests/prop_schema.rs` |
-| `record_pack::encode/decode_record_pack` | PROVEN (decoder totality) + PROPERTY (round-trip, projection, foreign schema) | any single ASCII corruption with the checksum restamped either errors or walks the directory without panicking; exact round-trip and projection on random schemas and records; a pack written under another schema is refused; arbitrary bytes never panic the reader | `record_pack.rs::verify`, `tests/prop_record_pack.rs` |
+| `record_pack::encode/decode_record_pack` | PROVEN (decoder totality) + PROPERTY (round-trip, projection, evolution) | any single ASCII corruption with the checksum restamped either errors or walks the directory without panicking; exact round-trip and projection on random schemas and records; an older pack reads under a schema that adds a field; a type change errors only when that field is read; arbitrary bytes never panic the reader | `record_pack.rs::verify`, `tests/prop_record_pack.rs` |
 | `query::record_matches` | PROPERTY | `and` and `or` follow their laws; `ge` equals `eq` or `gt`; `le` equals `eq` or `lt`; absent and null fields never match a comparison | `src/record_query/verification.rs` |
 | `query::record_stats_may_match` | PROPERTY | prune soundness: if a segment is pruned, no record it held satisfies the filter | same |
+| `schema::TableSchema::evolve` / `fill_defaults` / `same_shape` | PROPERTY | adding an optional field evolves, adding a required field only with a default, a type change is refused, defaults fill absent and null values only | `tests/prop_schema.rs` |
 | `query::RecordQuery::validate` | INTEGRATION | undeclared fields, wrong-typed filter values, and undeclared projections fail before any segment read | `record_query/tests.rs` |
 | `compact::build_record_stats` | INTEGRATION | exact i64, f64, and string bounds, distinct tracking with its cap, null and absent values leave a field unbounded | `record_stats_writer.rs` tests |
-| `compact::schema_store` | INTEGRATION | register once, identical re-registration is a no-op, a different shape conflicts, a stored shape is re-validated on load, isolation by tenant, namespace, and table | `schema_store.rs` tests |
+| `compact::schema_store` | INTEGRATION | identical re-registration is a no-op, a compatible shape becomes the next version, a type change and a bare required field are refused, a stored shape is re-validated on load, isolation by tenant, namespace, and table | `schema_store.rs` tests |
+| `compact::text_indexer` + `query::search_traces(text_query)` | INTEGRATION | prompts, outputs, nested JSON, and errors are searchable after compaction; hot spans are searchable before it; text combines with structural filters; corrupted containers are rejected; oversized fields clip | `text_indexer.rs`, `search.rs` tests, server e2e |
 | `query::query_records` / `get_record` | INTEGRATION | hot and cold merge with hot winning, stats prune proven by deleting the pruned pack, bloom-negative lookup, projection and limit, server e2e for custom tables and eval logs | `record_query/tests.rs`, server tests |
 | `get_trace` / `search_traces` / server | INTEGRATION | hot/cold merge, bloom skip proof, stats prune proof, e2e HTTP | `trace_fetch.rs`, `search.rs`, server tests |
 
@@ -116,6 +118,8 @@ non-blocking) on `tracelake-core`.
   planned; Miri is insurance — the codebase has no `unsafe` today.
 - `summarize_trace` deserves direct PROPERTY-tier coverage once search
   summaries stabilize.
+- Text search over the hot store builds an index per query. It is correct but
+  not benchmarked.
 - The record pack Kani harness (`record_pack.rs::verify`) exists and the
   `kani` workflow runs it. A local run exceeded 30 minutes on Apple Silicon, so
   the decoder stays PROPERTY tier until that CI job reports green.

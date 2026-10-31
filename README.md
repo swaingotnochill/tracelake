@@ -7,7 +7,7 @@ uses NVMe/memory as hot cache, and beats generic databases on trace-native workl
 
 - **Ingest** spans from any LLM app (OTLP, HTTP, gRPC).
 - **Fetch** a full trace tree in a single read — not a distributed row reconstruction.
-- **Search** prompts, outputs, tool errors with full-text search.
+- **Search** prompts, outputs, tool errors with a Tantivy full-text index.
 - **Aggregate** latency, cost, tokens, scores with columnar analytics.
 - **Define tables** with your own typed schema, including inspect-ai eval samples.
 
@@ -147,6 +147,10 @@ let result = reader
     })
     .await?;
 ```
+
+Schemas evolve. Adding an optional field, adding a required field with a default, and
+dropping a field are allowed; older segments keep their meaning because each pack records
+its own field list. Changing a field's type needs a new table.
 
 `POST /v1/evals` registers the eval schema, flattens an inspect-ai log, and writes one row
 per sample. See [docs/schemas.md](docs/schemas.md) for field types, storage layout, query

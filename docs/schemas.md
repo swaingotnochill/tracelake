@@ -34,15 +34,37 @@ The primary key must be a `string` field. Its value is the record's identity: th
 storage key suffix and the pack directory entry both come from it. A record carries no
 separate id field, so the two cannot disagree.
 
-## Register the schema
+## Register and evolve the schema
 
 ```rust
-put_schema(&store, base_path, tenant_id, namespace, &schema).await?;
+let registered = put_schema(&store, base_path, tenant_id, namespace, &schema).await?;
 ```
 
-Registration is once per table. Registering the same shape again is a no-op. Registering
-a different shape returns `CompactError::SchemaConflict`, because segments already
-written under the old fingerprint would no longer decode.
+The registry owns the version. The first registration writes version 1, an identical
+shape is a no-op, and a compatible change writes the next version. Segments record their
+own field list, so older data keeps its meaning after the schema moves on.
+
+| Change | Allowed | How old records read |
+|--------|---------|----------------------|
+| Add an optional field | yes | field absent |
+| Add a required field with a default | yes | the default |
+| Add a required field without a default | no | earlier records cannot satisfy it |
+| Drop a field | yes | field absent from the current schema |
+| Change a field's type | no | the pack would decode as the wrong type |
+| Change the primary key | no | record identity would change |
+
+Adding a required field needs `required_field_with_default`:
+
+```rust
+let schema = TableSchema::builder("inspect_ai_samples")
+    .field("sample_id", FieldType::String)
+    .required_field_with_default("grader", FieldType::String, json!("exact_match"))
+    .primary_key("sample_id")
+    .build()?;
+```
+
+A type change needs a new table name and a rewrite of the records. Type changes are
+refused because a pack written as `string` cannot be read as `i64` without guessing.
 
 ## Write records
 
@@ -103,11 +125,16 @@ Object store
 Record keys live under their own root, `v1/r/`, so a span scan and a record scan cannot
 read each other's values.
 
-A record pack is `[magic TRCREC01][schema fingerprint u64][record count u32][directory
-offset u64][record blocks][directory offsets][directory entries][crc32]`. A record block
-is a presence bitmap over the schema fields followed by the present values in schema
-order. The fingerprint makes a pack written under a different shape fail to decode
-instead of returning wrong values.
+A record pack is `[magic TRCREC01][field descriptors][record count u32][directory offset
+u64][record blocks][directory offsets][directory entries][crc32]`. Each descriptor holds
+a field name and its type. A record block is a presence bitmap over the pack's fields
+followed by the present values in that order. A reader maps fields by name, skips pack
+fields the current schema dropped, and fills declared defaults for fields the pack did
+not hold. A field whose stored type differs from the declared type is reported only when
+that field is read.
+
+The segment manifest stores per-field bounds with the type they were computed from, so a
+query never prunes on bounds from a different type.
 
 ## Stats and pruning
 
@@ -182,11 +209,25 @@ memory. Pruning removes whole pack reads, so it cuts both decoding and I/O. Proj
 skips the JSON parse of fields nobody asked for. With S3 as the store, add one GET per
 scanned pack and two per pruned segment (manifest and nothing else).
 
+## Text search
+
+Trace search accepts `text_query`. Compaction builds a Tantivy index over every span's
+name, input, output, and error and stores it as the segment's `.text` file. Text search
+runs the index per segment, then applies the structural filters, so a trace must match
+both.
+
+Spans still in the hot store are not indexed yet, so a text query builds a throwaway
+index over the hot spans for that request. It returns the same results, and it costs time
+proportional to the hot buffer. Compaction moves those spans into an indexed segment.
+
+Each indexed field is clipped at 256 KB (`MAX_INDEXED_TEXT_BYTES`). Prompts larger than
+that remain searchable in their first 256 KB.
+
 ## Limits
 
-- A schema is immutable once segments exist. To change the shape, register a new table
-  name and write the records again.
+- A field's type cannot change. Register a new table name and write the records again.
 - No joins, no aggregation, and no Parquet column files for records yet. Filtering is the
   pushdown; aggregation belongs to the columnar step.
 - Every segment read decodes all requested fields of every record in the pack. Selection
   pressure per pack is a later step.
+- Text search over the hot store rebuilds an index per query. It is correct, not cheap.
