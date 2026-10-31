@@ -313,9 +313,19 @@ Run end-to-end: ingest → compact → query.
 
 ### Step 10: tracelake-bench — Full Benchmark Suite
 
-Implement the benchmark suite described in [benchmark.md](benchmark.md). Do not claim
+`tracelake-bench` runs ingest, flush, hot and cold fetch, structural search, and
+text search phases over one synthetic corpus, printing dataset shape and
+correctness counts with each timing. Run it with
+`cargo run --release -p tracelake-bench`. Do not claim
 performance wins until the benchmark harness proves correctness, discloses dataset shape,
 and separates warm-cache, cold-cache, ingest, search, hydration, and freshness results.
+
+### Step 8 status
+
+`.columns` Parquet files are written for every span and record segment.
+`aggregate_spans` and `aggregate_records` register those files in DataFusion and
+answer grouped count, sum, avg, min, max, and p50/p95/p99 queries. Filters are
+not pushed into aggregation yet.
 
 ### Step 11: Custom Table Schemas and Eval Storage
 

@@ -267,7 +267,7 @@ impl TraceLakeReader {
         })
     }
 
-    async fn load_schema(
+    pub(crate) async fn load_schema(
         &self,
         tenant_id: &str,
         namespace: &str,
@@ -568,3 +568,59 @@ mod tests;
 
 #[cfg(test)]
 mod verification;
+
+#[cfg(kani)]
+mod verify {
+    use super::*;
+
+    /// A pruned `ge` bound proves no value in the segment reaches it.
+    #[kani::proof]
+    fn ge_prune_means_the_segment_max_is_below_the_bound() {
+        let min: i64 = kani::any();
+        let max: i64 = kani::any();
+        let value: i64 = kani::any();
+        kani::assume(min <= max);
+
+        if !allows(Op::Ge, Some(min), Some(max), value) {
+            assert!(max < value);
+        }
+    }
+
+    /// A pruned `le` bound proves no value in the segment is at or below it.
+    #[kani::proof]
+    fn le_prune_means_the_segment_min_is_above_the_bound() {
+        let min: i64 = kani::any();
+        let max: i64 = kani::any();
+        let value: i64 = kani::any();
+        kani::assume(min <= max);
+
+        if !allows(Op::Le, Some(min), Some(max), value) {
+            assert!(min > value);
+        }
+    }
+
+    /// A pruned equality bound proves the value lies outside the segment range.
+    #[kani::proof]
+    fn eq_prune_means_the_value_is_outside_the_range() {
+        let min: i64 = kani::any();
+        let max: i64 = kani::any();
+        let value: i64 = kani::any();
+        kani::assume(min <= max);
+
+        if !allows(Op::Eq, Some(min), Some(max), value) {
+            assert!(value < min || value > max);
+        }
+    }
+
+    /// Pruning never rejects a value that sits inside the segment range.
+    #[kani::proof]
+    fn equality_inside_the_range_is_never_pruned() {
+        let min: i64 = kani::any();
+        let max: i64 = kani::any();
+        let value: i64 = kani::any();
+        kani::assume(min <= max);
+        kani::assume(value >= min && value <= max);
+
+        assert!(allows(Op::Eq, Some(min), Some(max), value));
+    }
+}

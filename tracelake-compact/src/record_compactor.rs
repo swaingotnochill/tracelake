@@ -143,11 +143,23 @@ impl RecordCompactor {
             )
             .await?;
 
+        let columns_file = self
+            .put_file(
+                group,
+                &segment_id,
+                SegmentFileKind::Columns,
+                crate::column_writer::encode_parquet(&crate::column_writer::build_record_batch(
+                    &schema,
+                    &group.records,
+                )?)?,
+            )
+            .await?;
+
         let entry = SegmentEntry {
             segment_id: segment_id.clone(),
             trace_count: 0,
             span_count: 0,
-            files: vec![pack_file, bloom_file, stats_file],
+            files: vec![pack_file, bloom_file, stats_file, columns_file],
             stats: tracelake_core::SegmentStats::default(),
             record_stats: Some(record_stats),
         };

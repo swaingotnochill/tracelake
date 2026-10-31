@@ -82,6 +82,11 @@ pub enum SchemaError {
     #[error("field name cannot be empty")]
     EmptyFieldName,
 
+    #[error(
+        "field name '{name}' must use only letters, digits, '_', '.', or '-' and be at most 128 bytes"
+    )]
+    InvalidFieldName { name: String },
+
     #[error("field '{name}' is declared more than once")]
     DuplicateField { name: String },
 
@@ -291,6 +296,15 @@ impl TableSchema {
             if field.name.is_empty() {
                 return Err(SchemaError::EmptyFieldName);
             }
+            if field.name.len() > MAX_FIELD_NAME_BYTES
+                || !field.name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
+                })
+            {
+                return Err(SchemaError::InvalidFieldName {
+                    name: field.name.clone(),
+                });
+            }
             if seen.contains(&field.name.as_str()) {
                 return Err(SchemaError::DuplicateField {
                     name: field.name.clone(),
@@ -374,6 +388,10 @@ impl SchemaBuilder {
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Longest accepted field name. Names become Parquet column names and appear
+/// in aggregation SQL, so the character set is restricted as well.
+pub const MAX_FIELD_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -601,6 +619,18 @@ mod tests {
             .expect_err("empty field names are invalid");
         assert_eq!(empty, SchemaError::EmptyFieldName);
 
+        let quoted = TableSchema::builder("t")
+            .field("score\"; DROP TABLE x", FieldType::String)
+            .primary_key("id")
+            .build()
+            .expect_err("quoted field names are invalid");
+        assert_eq!(
+            quoted,
+            SchemaError::InvalidFieldName {
+                name: "score\"; DROP TABLE x".to_string()
+            }
+        );
+
         let empty_table = TableSchema::builder("")
             .field("id", FieldType::String)
             .primary_key("id")
@@ -743,5 +773,21 @@ mod tests {
             .set("count", json!(1))
             .set("score", json!(1));
         schema.validate(&integral).expect("integer f64 accepted");
+    }
+}
+
+#[cfg(kani)]
+mod verify {
+    use super::*;
+
+    /// Every tag the pack format writes maps back to the type that wrote it,
+    /// and every byte either maps to a type or is rejected.
+    #[kani::proof]
+    fn field_type_tags_round_trip() {
+        let tag: u8 = kani::any();
+
+        if let Some(field_type) = FieldType::from_tag(tag) {
+            assert_eq!(field_type.tag(), tag);
+        }
     }
 }

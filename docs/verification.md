@@ -63,6 +63,10 @@ catches that. That is the boundary, stated plainly.
 | `compact::build_record_stats` | INTEGRATION | exact i64, f64, and string bounds, distinct tracking with its cap, null and absent values leave a field unbounded | `record_stats_writer.rs` tests |
 | `compact::schema_store` | INTEGRATION | identical re-registration is a no-op, a compatible shape becomes the next version, a type change and a bare required field are refused, a stored shape is re-validated on load, isolation by tenant, namespace, and table | `schema_store.rs` tests |
 | `compact::text_indexer` + `query::search_traces(text_query)` | INTEGRATION | prompts, outputs, nested JSON, and errors are searchable after compaction; hot spans are searchable before it; text combines with structural filters; corrupted containers are rejected; oversized fields clip | `text_indexer.rs`, `search.rs` tests, server e2e |
+| `schema::FieldType::tag` / `from_tag` | PROVEN | every tag the pack writes maps back to its type; every other byte is rejected | `schema.rs::verify` (Kani) |
+| `query::allows` (prune bounds) | PROVEN + PROPERTY | a pruned `ge`, `le`, or `eq` bound proves no value in the segment can satisfy it; a value inside the range is never pruned | `record_query.rs::verify` (Kani), `record_query/verification.rs` |
+| `compact::column_writer` | INTEGRATION | record and span columns round-trip through Parquet; missing values become nulls; JSON fields stay out of columns | `column_writer.rs` tests |
+| `query::aggregate_records` / `aggregate_spans` | INTEGRATION | grouped count, avg, sum, and p95 over one and many column files; segments written under an older schema contribute nulls; unknown fields are rejected | `aggregate.rs` tests, server e2e |
 | `query::query_records` / `get_record` | INTEGRATION | hot and cold merge with hot winning, stats prune proven by deleting the pruned pack, bloom-negative lookup, projection and limit, server e2e for custom tables and eval logs | `record_query/tests.rs`, server tests |
 | `get_trace` / `search_traces` / server | INTEGRATION | hot/cold merge, bloom skip proof, stats prune proof, e2e HTTP | `trace_fetch.rs`, `search.rs`, server tests |
 
@@ -120,6 +124,10 @@ non-blocking) on `tracelake-core`.
   summaries stabilize.
 - Text search over the hot store builds an index per query. It is correct but
   not benchmarked.
+- Aggregation accepts no filter yet. A filtered aggregate reads every column
+  file for the table.
+- The span and record Kani harnesses are the only decoder proofs; the
+  DataFusion SQL generation and Parquet writing are INTEGRATION tier.
 - The record pack Kani harness (`record_pack.rs::verify`) exists and the
   `kani` workflow runs it. A local run exceeded 30 minutes on Apple Silicon, so
   the decoder stays PROPERTY tier until that CI job reports green.

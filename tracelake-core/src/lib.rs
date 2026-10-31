@@ -9,14 +9,15 @@ pub mod trace_pack;
 
 pub use bloom::{BloomError, BloomFilter, DEFAULT_FALSE_POSITIVE_RATE};
 pub use key::{
-    KeyError, RecordKey, SpanKey, decode_record_key, decode_span_key, encode_record_key,
-    encode_span_key, encode_span_storage_key, namespace_prefix, namespace_record_prefix,
-    record_prefix, record_root_prefix, span_root_prefix, tenant_prefix, trace_prefix,
+    KeyError, MAX_SEGMENT_BYTES, RecordKey, SpanKey, decode_record_key, decode_span_key,
+    encode_record_key, encode_span_key, encode_span_storage_key, namespace_prefix,
+    namespace_record_prefix, record_prefix, record_root_prefix, span_root_prefix, tenant_prefix,
+    trace_prefix, validate_path_segment,
 };
 
 pub use schema::{
-    EvolutionError, FieldDef, FieldType, FieldValue, Record, RecordError, SCHEMA_VERSION,
-    SchemaBuilder, SchemaError, TableSchema, typed_value,
+    EvolutionError, FieldDef, FieldType, FieldValue, MAX_FIELD_NAME_BYTES, Record, RecordError,
+    SCHEMA_VERSION, SchemaBuilder, SchemaError, TableSchema, typed_value,
 };
 
 pub use segment::{

@@ -15,6 +15,7 @@ pub async fn read_manifest(
     tenant_id: &str,
     namespace: &str,
 ) -> Result<Option<SegmentManifest>, CompactError> {
+    crate::validate_location(tenant_id, namespace, None)?;
     read_manifest_at(store, &manifest_path(base_path, tenant_id, namespace, None)).await
 }
 
@@ -26,6 +27,7 @@ pub async fn read_record_manifest(
     namespace: &str,
     table: &str,
 ) -> Result<Option<SegmentManifest>, CompactError> {
+    crate::validate_location(tenant_id, namespace, Some(table))?;
     read_manifest_at(
         store,
         &manifest_path(base_path, tenant_id, namespace, Some(table)),
@@ -54,6 +56,11 @@ pub async fn publish_manifest(
     base_path: &str,
     manifest: &SegmentManifest,
 ) -> Result<(), CompactError> {
+    crate::validate_location(
+        &manifest.tenant_id,
+        &manifest.namespace,
+        manifest.table.as_deref(),
+    )?;
     let bytes = serde_json::to_vec(manifest)?;
     let path = manifest_path(
         base_path,

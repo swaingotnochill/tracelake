@@ -6,9 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arrow-array = "60"
+arrow-schema = "60"
 chrono = { version = "0.4.45", features = ["serde"] }
 crc32fast = "1.5.0"
 serde_json = "1.0.150"
+parquet = { version = "60", features = ["arrow"] }
 slatedb = "0.13.1"
 tantivy = "0.25"
 tempfile = "3"

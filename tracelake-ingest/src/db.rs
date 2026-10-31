@@ -26,12 +26,17 @@ pub struct TraceLakeDb {
 }
 
 impl TraceLakeDb {
-    /// Opens a TraceLake database backed by SlateDB's in-memory object store.
-    pub async fn open_in_memory(path: &str) -> Result<Self, IngestError> {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    /// Opens a hot store on any SlateDB object store. The path names a
+    /// directory inside that store.
+    pub async fn open(object_store: Arc<dyn ObjectStore>, path: &str) -> Result<Self, IngestError> {
         let db = Db::builder(path, object_store).build().await?;
 
         Ok(Self { db })
+    }
+
+    /// Opens a TraceLake database backed by SlateDB's in-memory object store.
+    pub async fn open_in_memory(path: &str) -> Result<Self, IngestError> {
+        Self::open(Arc::new(InMemory::new()), path).await
     }
 
     /// Writes one span under its canonical TraceLake storage key.
@@ -412,6 +417,35 @@ mod tests {
             spans,
             vec![first, second, other_trace, other_namespace, other_tenant]
         );
+    }
+
+    #[tokio::test]
+    async fn spans_survive_a_reopen_on_a_local_store() {
+        use slatedb::object_store::local::LocalFileSystem;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("local store"));
+        let span = get_example_span();
+
+        let db = TraceLakeDb::open(Arc::clone(&store), "hot")
+            .await
+            .expect("db should open");
+        db.put_spans(std::slice::from_ref(&span))
+            .await
+            .expect("span should write");
+        db.db.flush().await.expect("flush should succeed");
+        drop(db);
+
+        let reopened = TraceLakeDb::open(store, "hot")
+            .await
+            .expect("db should reopen");
+        let spans = reopened
+            .get_trace_spans("tenantid-1", "default", "trace-1")
+            .await
+            .expect("spans should read after reopen");
+
+        assert_eq!(spans, vec![span]);
     }
 
     #[tokio::test]

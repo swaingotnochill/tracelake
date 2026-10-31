@@ -39,6 +39,19 @@ pub enum KeyError {
     #[error("{field} cannot contain '/'")]
     SegmentContainsDelimiter { field: &'static str },
 
+    #[error("{field} cannot be '.' or '..'")]
+    ReservedSegment { field: &'static str },
+
+    #[error("{field} contains a control character or backslash")]
+    InvalidSegmentCharacter { field: &'static str },
+
+    #[error("{field} is {len} bytes, longer than the {max} byte limit")]
+    SegmentTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+
     #[error("start_time_ns cannot be negative: {start_time_ns}")]
     NegativeTimestamp { start_time_ns: i64 },
 
@@ -267,7 +280,15 @@ fn split_span_key(key: &str) -> Result<Vec<&str>, KeyError> {
     Ok(parts)
 }
 
-fn validate_segment(field: &'static str, value: &str) -> Result<(), KeyError> {
+/// Longest accepted tenant, namespace, table, trace, or record identifier.
+/// The value ends up in a SlateDB key and, for some fields, in an object store
+/// path, so it must stay short and portable.
+pub const MAX_SEGMENT_BYTES: usize = 1024;
+
+/// Validates one identifier that becomes a key segment or an object store path
+/// component. Rejecting `.` and `..` keeps a file-system object store from
+/// resolving a tenant or table name outside the database root.
+pub fn validate_path_segment(field: &'static str, value: &str) -> Result<(), KeyError> {
     if value.is_empty() {
         return Err(KeyError::EmptySegment { field });
     }
@@ -276,7 +297,27 @@ fn validate_segment(field: &'static str, value: &str) -> Result<(), KeyError> {
         return Err(KeyError::SegmentContainsDelimiter { field });
     }
 
+    if value == "." || value == ".." {
+        return Err(KeyError::ReservedSegment { field });
+    }
+
+    if value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(KeyError::InvalidSegmentCharacter { field });
+    }
+
+    if value.len() > MAX_SEGMENT_BYTES {
+        return Err(KeyError::SegmentTooLong {
+            field,
+            len: value.len(),
+            max: MAX_SEGMENT_BYTES,
+        });
+    }
+
     Ok(())
+}
+
+fn validate_segment(field: &'static str, value: &str) -> Result<(), KeyError> {
+    validate_path_segment(field, value)
 }
 
 fn validate_timestamp(start_time_ns: i64) -> Result<(), KeyError> {
@@ -532,6 +573,37 @@ mod tests {
         assert!(!record_key.starts_with(span_root_prefix()));
         assert!(decode_record_key(&span_key).is_err());
         assert!(decode_span_key(&record_key).is_err());
+    }
+
+    #[test]
+    fn path_segments_reject_traversal_and_control_characters() {
+        assert_eq!(
+            validate_path_segment("tenant_id", ".."),
+            Err(KeyError::ReservedSegment { field: "tenant_id" })
+        );
+        assert_eq!(
+            validate_path_segment("table", "."),
+            Err(KeyError::ReservedSegment { field: "table" })
+        );
+        assert_eq!(
+            validate_path_segment("namespace", "a\\b"),
+            Err(KeyError::InvalidSegmentCharacter { field: "namespace" })
+        );
+        assert_eq!(
+            validate_path_segment("record_id", "a\u{0}b"),
+            Err(KeyError::InvalidSegmentCharacter { field: "record_id" })
+        );
+
+        let long = "a".repeat(MAX_SEGMENT_BYTES + 1);
+        assert_eq!(
+            validate_path_segment("table", &long),
+            Err(KeyError::SegmentTooLong {
+                field: "table",
+                len: MAX_SEGMENT_BYTES + 1,
+                max: MAX_SEGMENT_BYTES
+            })
+        );
+        assert!(validate_path_segment("tenant_id", "tenant-1").is_ok());
     }
 
     #[test]

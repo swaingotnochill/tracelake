@@ -9,6 +9,10 @@ use std::sync::Arc;
 use tracelake_ingest::TraceLakeDb;
 use tracelake_query::TraceLakeReader;
 
+/// Largest accepted JSON request body. Spans and eval logs are batched, but a
+/// single request must not be able to exhaust memory.
+pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 /// Shared server state: the hot store, the segment store, and the reader
 /// that merges them. Cloned per request; every clone shares the same
 /// underlying handles.
@@ -67,7 +71,16 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/v1/tables/{tenant_id}/{namespace}/{table}/query",
             axum::routing::post(table_handler::post_record_query),
         )
+        .route(
+            "/v1/tables/{tenant_id}/{namespace}/{table}/aggregate",
+            axum::routing::post(table_handler::post_record_aggregate),
+        )
+        .route(
+            "/v1/spans/aggregate",
+            axum::routing::post(query_handler::post_span_aggregate),
+        )
         .route("/v1/evals", axum::routing::post(table_handler::post_evals))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
 
@@ -297,6 +310,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsafe_identifiers_are_rejected_before_touching_storage() {
+        let app = build_router(test_state().await);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/evals",
+            Some(json!({
+                "tenant_id": "..",
+                "namespace": "default",
+                "log": { "eval": {}, "samples": [] }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("tenant_id"));
+
+        let (status, _) = call(
+            app,
+            "GET",
+            "/v1/tables/%2E%2E/default/findings/schema",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tenants_and_namespaces_are_isolated() {
+        let app = build_router(test_state().await);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": [example_span("trace-isolated", "span-a", 1)] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/traces/tenantid-2/default/trace-isolated",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/traces/search",
+            Some(json!({ "tenant_id": "tenantid-2", "namespace": "default" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
+
+        let schema = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(schema),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-1" }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-2/default/findings/schema",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            app,
+            "POST",
+            "/v1/tables/tenantid-2/default/findings/query",
+            Some(json!({ "limit": 10 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn malformed_body_is_rejected_with_400() {
         let app = build_router(test_state().await);
 
@@ -419,6 +537,114 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "error");
         assert_eq!(body["error"], "model timeout");
+    }
+
+    #[tokio::test]
+    async fn span_aggregation_groups_by_model_and_computes_percentiles() {
+        let app = build_router(test_state().await);
+        let mut spans = Vec::new();
+
+        for (index, (model, latency_ms)) in [
+            ("gpt-4o", 100),
+            ("gpt-4o", 200),
+            ("claude-3", 500),
+            ("claude-3", 1000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut span = example_span(&format!("trace-{index}"), "span-a", index as i64);
+            span.model = Some(model.to_string());
+            span.end_time = Some(span.start_time + chrono::Duration::milliseconds(latency_ms));
+            spans.push(span);
+        }
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": spans })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans/aggregate",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "group_by": ["model"],
+                "metrics": [
+                    "count",
+                    { "p95": { "field": "latency_ms" } },
+                    { "sum": { "field": "cost_usd" } }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+
+        let gpt = rows
+            .iter()
+            .find(|row| row["model"] == "gpt-4o")
+            .expect("gpt-4o row");
+        assert_eq!(gpt["count"], 2);
+        let p95 = gpt["p95_latency_ms"].as_f64().expect("p95");
+        assert!((100.0..=200.0).contains(&p95), "p95 was {p95}");
+
+        let claude = rows
+            .iter()
+            .find(|row| row["model"] == "claude-3")
+            .expect("claude row");
+        assert_eq!(claude["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn record_aggregation_reads_column_files() {
+        let app = build_router(test_state().await);
+
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/evals",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "evals",
+                "log": eval_log_fixture()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/evals/inspect_ai_samples/aggregate",
+            Some(json!({
+                "group_by": ["task"],
+                "metrics": [
+                    "count",
+                    { "avg": { "field": "score" } },
+                    { "p50": { "field": "total_tokens" } }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["task"], "gsm8k");
+        assert_eq!(rows[0]["count"], 2);
+        assert_eq!(rows[0]["avg_score"], 0.5);
     }
 
     #[tokio::test]

@@ -52,6 +52,7 @@ pub enum SegmentFileKind {
     Bloom,
     Stats,
     Text,
+    Columns,
 }
 
 impl SegmentFileKind {
@@ -63,6 +64,7 @@ impl SegmentFileKind {
             SegmentFileKind::Bloom => "bloom",
             SegmentFileKind::Stats => "stats",
             SegmentFileKind::Text => "text",
+            SegmentFileKind::Columns => "columns",
         }
     }
 }

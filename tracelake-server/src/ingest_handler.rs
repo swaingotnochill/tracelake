@@ -96,12 +96,14 @@ fn ingest_error_response(error: &IngestError) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
-/// Maps any other failure to a 500 with the error message.
+/// Maps any other failure to a 500. The detail goes to stderr, not the client,
+/// because it can name object store paths and internal identifiers.
 fn error_response(error: &impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
+    eprintln!("internal error: {error}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
-            error: error.to_string(),
+            error: "internal error".to_string(),
         }),
     )
 }

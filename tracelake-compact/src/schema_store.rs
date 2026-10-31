@@ -21,6 +21,7 @@ pub async fn read_schema(
     namespace: &str,
     table: &str,
 ) -> Result<Option<TableSchema>, CompactError> {
+    crate::validate_location(tenant_id, namespace, Some(table))?;
     let path = schema_path(base_path, tenant_id, namespace, table);
 
     match store.get(&Path::from(path.as_str())).await {
@@ -48,6 +49,7 @@ pub async fn put_schema(
     schema: &TableSchema,
 ) -> Result<TableSchema, CompactError> {
     schema.validate_shape()?;
+    crate::validate_location(tenant_id, namespace, Some(&schema.table))?;
 
     let next = match read_schema(store, base_path, tenant_id, namespace, &schema.table).await? {
         None => {

@@ -928,7 +928,8 @@ mod verify {
 
         let entry_offsets_pos = header.len() + payload.len();
         let entries_pos = entry_offsets_pos + 8;
-        header[header.len() - 8..].copy_from_slice(&(entry_offsets_pos as u64).to_le_bytes());
+        let offset_pos = header.len() - 8;
+        header[offset_pos..].copy_from_slice(&(entry_offsets_pos as u64).to_le_bytes());
 
         let mut pack = header;
         pack.extend_from_slice(payload);

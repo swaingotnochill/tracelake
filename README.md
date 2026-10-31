@@ -152,6 +152,25 @@ Schemas evolve. Adding an optional field, adding a required field with a default
 dropping a field are allowed; older segments keep their meaning because each pack records
 its own field list. Changing a field's type needs a new table.
 
+Aggregation runs over the Parquet column files that compaction writes:
+
+```rust
+let result = reader
+    .aggregate_records(tenant_id, namespace, "inspect_ai_samples", &AggregateRequest {
+        group_by: vec!["task".into()],
+        metrics: vec![
+            AggregateMetric::Count,
+            AggregateMetric::Avg { field: "score".into() },
+            AggregateMetric::P95 { field: "total_tokens".into() },
+        ],
+        ..AggregateRequest::default()
+    })
+    .await?;
+```
+
+`POST /v1/spans/aggregate` does the same for span columns, for example p95
+latency grouped by model.
+
 `POST /v1/evals` registers the eval schema, flattens an inspect-ai log, and writes one row
 per sample. See [docs/schemas.md](docs/schemas.md) for field types, storage layout, query
 semantics, pruning rules, and measured costs.
@@ -214,8 +233,12 @@ tracelake/
 
 ## Status
 
-Steps 1 to 9 of the build order are done, and Step 11 adds custom table schemas and
-inspect-ai eval storage. Step 10, the benchmark suite, is next. See [AGENTS.md](AGENTS.md).
+Steps 1 to 11 of the build order are implemented: ingest, trace fetch, search,
+Tantivy text search, Parquet column files with DataFusion aggregation, the HTTP
+API, custom table schemas with evolution, inspect-ai eval storage, and the
+benchmark suite. Alpha readiness, security posture, and gaps against SmithDB and
+Brainstore are recorded in [docs/security.md](docs/security.md) and
+[docs/research/gap-analysis.md](docs/research/gap-analysis.md).
 
 ## License
 

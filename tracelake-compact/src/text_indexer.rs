@@ -232,6 +232,21 @@ fn collect_files(
     Ok(())
 }
 
+/// An index object is written at query time, so a crafted name must not escape
+/// the temporary directory.
+fn safe_relative(name: &str) -> Result<&FsPath, TextIndexError> {
+    let path = FsPath::new(name);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(TextIndexError::InvalidName);
+    }
+
+    Ok(path)
+}
+
 fn unpack_container(bytes: &[u8], root: &FsPath) -> Result<(), TextIndexError> {
     if bytes.len() < MAGIC.len() + 4 + 4 {
         return Err(TextIndexError::Container);
@@ -285,7 +300,7 @@ fn unpack_container(bytes: &[u8], root: &FsPath) -> Result<(), TextIndexError> {
             .ok_or(TextIndexError::Container)?;
         pos += bytes_len;
 
-        let path = root.join(name);
+        let path = root.join(safe_relative(name)?);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -450,6 +465,14 @@ mod tests {
         let hits = search_text_index(&bytes, "duplicated", 10).unwrap();
 
         assert_eq!(hits, vec!["trace-nested".to_string()]);
+    }
+
+    #[test]
+    fn container_names_cannot_escape_the_extraction_directory() {
+        assert!(safe_relative("meta.json").is_ok());
+        assert!(safe_relative("../escape").is_err());
+        assert!(safe_relative("/absolute").is_err());
+        assert!(safe_relative("a/../../escape").is_err());
     }
 
     #[test]

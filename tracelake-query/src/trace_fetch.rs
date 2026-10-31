@@ -56,6 +56,9 @@ pub enum QueryError {
 
     #[error("record does not match its schema: {0}")]
     Record(#[from] tracelake_core::RecordError),
+
+    #[error("aggregation failed: {reason}")]
+    Aggregate { reason: String },
 }
 
 /// Reads traces by merging the hot SlateDB store with compacted segments.

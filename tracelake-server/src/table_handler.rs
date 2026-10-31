@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use tracelake_compact::{CompactError, put_schema, read_schema};
 use tracelake_core::{Record, TableSchema};
 use tracelake_ingest::{EvalLog, IngestError, eval_sample_schema, sample_records};
-use tracelake_query::{QueryError, RecordQuery};
+use tracelake_query::{AggregateRequest, AggregateResult, QueryError, RecordQuery};
 
 use crate::AppState;
 use crate::ingest_handler::ErrorBody;
@@ -41,6 +41,8 @@ pub async fn put_table_schema(
     Path((tenant_id, namespace, table)): Path<(String, String, String)>,
     Json(schema): Json<TableSchema>,
 ) -> ApiResult<Value> {
+    validate_location(&tenant_id, &namespace, &table)?;
+
     if schema.table != table {
         return Err(bad_request(format!(
             "schema table '{}' does not match path table '{table}'",
@@ -73,6 +75,7 @@ pub async fn get_table_schema(
     State(state): State<AppState>,
     Path((tenant_id, namespace, table)): Path<(String, String, String)>,
 ) -> ApiResult<TableSchema> {
+    validate_location(&tenant_id, &namespace, &table)?;
     let schema = read_schema(
         &state.store,
         &state.base_path,
@@ -97,6 +100,7 @@ pub async fn post_records(
     Path((tenant_id, namespace, table)): Path<(String, String, String)>,
     Json(body): Json<RecordsBody>,
 ) -> ApiResult<Value> {
+    validate_location(&tenant_id, &namespace, &table)?;
     let schema = load_schema(&state, &tenant_id, &namespace, &table).await?;
     let records: Vec<Record> = body
         .records
@@ -118,6 +122,9 @@ pub async fn get_record(
     State(state): State<AppState>,
     Path((tenant_id, namespace, table, record_id)): Path<(String, String, String, String)>,
 ) -> ApiResult<Map<String, Value>> {
+    validate_location(&tenant_id, &namespace, &table)?;
+    tracelake_core::validate_path_segment("record_id", &record_id)
+        .map_err(|error| bad_request(error.to_string()))?;
     let record = state
         .reader
         .get_record(&tenant_id, &namespace, &table, &record_id)
@@ -136,6 +143,7 @@ pub async fn post_record_query(
     Path((tenant_id, namespace, table)): Path<(String, String, String)>,
     Json(query): Json<RecordQuery>,
 ) -> ApiResult<RecordListBody> {
+    validate_location(&tenant_id, &namespace, &table)?;
     let result = state
         .reader
         .query_records(&tenant_id, &namespace, &table, &query)
@@ -156,11 +164,32 @@ pub async fn post_record_query(
     ))
 }
 
+/// Groups and aggregates one table's column files.
+pub async fn post_record_aggregate(
+    State(state): State<AppState>,
+    Path((tenant_id, namespace, table)): Path<(String, String, String)>,
+    Json(request): Json<AggregateRequest>,
+) -> ApiResult<AggregateResult> {
+    validate_location(&tenant_id, &namespace, &table)?;
+    let result = state
+        .reader
+        .aggregate_records(&tenant_id, &namespace, &table, &request)
+        .await
+        .map_err(query_error)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
 /// Ingests one inspect-ai eval log as rows of `inspect_ai_samples`.
 pub async fn post_evals(
     State(state): State<AppState>,
     Json(body): Json<EvalsBody>,
 ) -> ApiResult<Value> {
+    validate_location(
+        &body.tenant_id,
+        &body.namespace,
+        tracelake_ingest::EVAL_SAMPLE_TABLE,
+    )?;
     let schema = match read_schema(
         &state.store,
         &state.base_path,
@@ -267,8 +296,28 @@ fn not_found(message: String) -> (StatusCode, Json<ErrorBody>) {
 }
 
 fn server_error(message: String) -> (StatusCode, Json<ErrorBody>) {
+    eprintln!("internal error: {message}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorBody { error: message }),
+        Json(ErrorBody {
+            error: "internal error".to_string(),
+        }),
     )
+}
+
+fn validate_location(
+    tenant_id: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    for (field, value) in [
+        ("tenant_id", tenant_id),
+        ("namespace", namespace),
+        ("table", table),
+    ] {
+        tracelake_core::validate_path_segment(field, value)
+            .map_err(|error| bad_request(error.to_string()))?;
+    }
+
+    Ok(())
 }

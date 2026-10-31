@@ -12,6 +12,9 @@ use tracelake_ingest::TraceLakeDb;
 /// Errors returned by the compaction pipeline.
 #[derive(Debug, Error)]
 pub enum CompactError {
+    #[error("identifier is not path safe: {0}")]
+    Key(#[from] tracelake_core::KeyError),
+
     #[error("hot store scan failed: {0}")]
     Scan(#[from] tracelake_ingest::IngestError),
 
@@ -32,6 +35,12 @@ pub enum CompactError {
 
     #[error("text index failed: {0}")]
     Text(#[from] crate::text_indexer::TextIndexError),
+
+    #[error("column file failed: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+
+    #[error("parquet failed: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
 
     #[error("table '{table}' has no registered schema")]
     SchemaNotFound { table: String },
@@ -182,6 +191,22 @@ impl Compactor {
             )
             .await?;
 
+        let spans: Vec<tracelake_core::Span> = group
+            .traces
+            .iter()
+            .flat_map(|trace| trace.spans.iter().cloned())
+            .collect();
+        let columns_file = self
+            .put_file(
+                group,
+                &segment_id,
+                SegmentFileKind::Columns,
+                crate::column_writer::encode_parquet(&crate::column_writer::build_span_batch(
+                    &spans,
+                )?)?,
+            )
+            .await?;
+
         let stats = build_segment_stats(group);
         let stats_file = self
             .put_file(
@@ -196,7 +221,7 @@ impl Compactor {
             segment_id: segment_id.clone(),
             trace_count: stats.trace_count,
             span_count: stats.span_count,
-            files: vec![pack_file, bloom_file, stats_file, text_file],
+            files: vec![pack_file, bloom_file, stats_file, text_file, columns_file],
             stats,
             record_stats: None,
         };
@@ -429,7 +454,7 @@ mod tests {
         assert_eq!(entry.segment_id, "segment-000001");
         assert_eq!(entry.trace_count, TRACE_COUNT as u64);
         assert_eq!(entry.span_count, SPAN_COUNT as u64);
-        assert_eq!(entry.files.len(), 4);
+        assert_eq!(entry.files.len(), 5);
 
         let kinds: Vec<_> = entry
             .files

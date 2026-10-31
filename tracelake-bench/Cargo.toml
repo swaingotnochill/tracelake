@@ -1,0 +1,16 @@
+[package]
+name = "tracelake-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+serde_json = "1.0.150"
+slatedb = "0.13.1"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+tracelake-compact = { version = "0.1.0", path = "../tracelake-compact" }
+tracelake-core = { version = "0.1.0", path = "../tracelake-core" }
+tracelake-ingest = { version = "0.1.0", path = "../tracelake-ingest" }
+tracelake-query = { version = "0.1.0", path = "../tracelake-query" }
