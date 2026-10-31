@@ -23,6 +23,7 @@ is explicitly out of scope.
 | Read limits | timeout and per-tenant cap | limiter unit tests, 429 e2e test |
 | Dependency advisories | `audit` CI workflow | `.github/workflows/audit.yml` |
 | Select an object store | `TRACELAKE_STORE=local`, `s3`, or `gcs` | `store.rs` tests |
+| Change a field's type | register the new type | migration e2e test |
 | Durable storage | `TRACELAKE_DATA_DIR`, or an S3 or GCS bucket | restart test, store selection tests |
 | Compaction | `POST /v1/compact` | segment tests, server e2e |
 

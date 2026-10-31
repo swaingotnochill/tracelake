@@ -212,7 +212,7 @@ proptest! {
     }
 
     #[test]
-    fn a_type_change_is_always_refused(declared in fields()) {
+    fn a_type_change_is_reported_for_migration(declared in fields()) {
         let Some(target) = declared
             .iter()
             .find(|field| field.name != "id")
@@ -232,12 +232,12 @@ proptest! {
                 };
             }
         }
+        let next = schema_from(&changed);
 
-        let refused = matches!(
-            base.evolve(&schema_from(&changed)),
-            Err(EvolutionError::TypeChanged { .. })
-        );
-        prop_assert!(refused);
+        let changes = base.type_changes(&next);
+        prop_assert_eq!(changes.len(), 1);
+        prop_assert_eq!(changes[0].0.as_str(), target.name.as_str());
+        prop_assert_eq!(base.evolve(&next), Ok(()));
     }
 
     #[test]

@@ -1313,6 +1313,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_type_change_migrates_existing_rows() {
+        use tracelake_compact::read_record_manifest;
+
+        let state = test_state().await;
+        let store = Arc::clone(&state.store);
+        let app = build_router(state);
+
+        let v1 = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "confidence", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [
+                { "finding_id": "f-1", "confidence": "0.25" },
+                { "finding_id": "f-2", "confidence": "0.75" }
+            ] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut span = example_span("trace-text", "span-a", 1);
+        span.output = Some(json!({ "text": "hallucination in the answer" }));
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/spans",
+            Some(json!({ "spans": [span] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let before = read_record_manifest(&store, BASE_PATH, "tenantid-1", "default", "findings")
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        let before_id = before.segments[0].segment_id.clone();
+
+        let v2 = json!({
+            "version": 2,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "confidence", "field_type": "f64", "required": true }
+            ]
+        });
+        let (status, body) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v2),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["version"], 2);
+
+        let after = read_record_manifest(&store, BASE_PATH, "tenantid-1", "default", "findings")
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        assert_ne!(
+            after.segments[0].segment_id, before_id,
+            "the segment was rewritten under the new type"
+        );
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/default/findings/records/f-1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["confidence"].as_f64(), Some(0.25));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/query",
+            Some(json!({
+                "filter": { "ge": { "field": "confidence", "value": 0.5 } }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["records"].as_array().expect("records");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["finding_id"], "f-2");
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/aggregate",
+            Some(json!({
+                "metrics": ["count", { "avg": { "field": "confidence" } }]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["count"], 2);
+        let average = body["rows"][0]["avg_confidence"]
+            .as_f64()
+            .expect("average is a number");
+        assert!((average - 0.5).abs() < 1e-9, "average was {average}");
+
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/traces/search",
+            Some(json!({
+                "tenant_id": "tenantid-1",
+                "namespace": "default",
+                "text_query": "hallucination"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_type_change_that_cannot_convert_leaves_the_schema_unchanged() {
+        let app = build_router(test_state().await);
+
+        let v1 = json!({
+            "version": 1,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "code", "field_type": "string", "required": true }
+            ]
+        });
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/v1/tables/tenantid-1/default/findings/records",
+            Some(json!({ "records": [{ "finding_id": "f-1", "code": "abc" }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "POST", "/v1/compact", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let v2 = json!({
+            "version": 2,
+            "table": "findings",
+            "primary_key": "finding_id",
+            "fields": [
+                { "name": "finding_id", "field_type": "string", "required": true },
+                { "name": "code", "field_type": "i64", "required": true }
+            ]
+        });
+        let (status, failure) = call(
+            app.clone(),
+            "PUT",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            Some(v2),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{failure}");
+
+        let (status, body) = call(
+            app.clone(),
+            "GET",
+            "/v1/tables/tenantid-1/default/findings/schema",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["fields"][1]["field_type"], "string");
+
+        let (status, body) = call(
+            app,
+            "GET",
+            "/v1/tables/tenantid-1/default/findings/records/f-1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "abc");
+    }
+
+    #[tokio::test]
     async fn custom_tables_accept_records_only_after_schema_registration() {
         let app = build_router(test_state().await);
         let schema = json!({
@@ -1400,11 +1611,13 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(
-            failure["error"],
-            "field 'severity' changed type from string to i64"
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            failure["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("severity")),
+            "the conversion failure names the field: {failure}"
         );
-        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

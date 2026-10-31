@@ -109,13 +109,6 @@ pub enum EvolutionError {
     #[error("primary key changed from '{from}' to '{to}'")]
     PrimaryKeyChanged { from: String, to: String },
 
-    #[error("field '{name}' changed type from {from} to {to}")]
-    TypeChanged {
-        name: String,
-        from: &'static str,
-        to: &'static str,
-    },
-
     #[error("new required field '{name}' has no default, so earlier records cannot satisfy it")]
     RequiredWithoutDefault { name: String },
 }
@@ -238,36 +231,59 @@ impl TableSchema {
         }
     }
 
+    /// Fields present in both shapes with different declared types. The
+    /// registry uses this to decide whether stored segments need a rewrite.
+    pub fn type_changes(&self, next: &TableSchema) -> Vec<(String, FieldType, FieldType)> {
+        self.fields
+            .iter()
+            .filter_map(|field| {
+                let replacement = next.field(&field.name)?;
+                (replacement.field_type != field.field_type)
+                    .then(|| (field.name.clone(), field.field_type, replacement.field_type))
+            })
+            .collect()
+    }
+
+    /// Coerces every present field to its declared type, converting values
+    /// written under an older schema. Returns the first value that cannot be
+    /// converted.
+    pub fn normalize(&self, record: &mut Record) -> Result<(), RecordError> {
+        for field in &self.fields {
+            let Some(value) = record.fields.get(&field.name) else {
+                continue;
+            };
+            if value.is_null() || typed_value(field, value).is_ok() {
+                continue;
+            }
+
+            let Some(converted) = coerce_value(value, field.field_type) else {
+                return Err(RecordError::TypeMismatch {
+                    name: field.name.clone(),
+                    expected: field.field_type.as_str(),
+                });
+            };
+            record.fields.insert(field.name.clone(), converted);
+        }
+
+        Ok(())
+    }
+
     pub fn same_shape(&self, other: &TableSchema) -> bool {
         self.table == other.table
             && self.primary_key == other.primary_key
             && self.fields == other.fields
     }
 
-    /// Whether `next` may replace `self` without rewriting stored segments.
-    ///
-    /// Adding an optional field is safe. Adding a required field is safe only
-    /// with a default that older records read as. Dropping a field hides its
-    /// values but leaves them in older packs. Changing a type is refused.
+    /// Whether `next` may replace `self`. Adding an optional field is safe.
+    /// Adding a required field is safe only with a default that older records
+    /// read as. Dropping a field hides its values but leaves them in older
+    /// packs. A type change is permitted and must be migrated by the registry.
     pub fn evolve(&self, next: &TableSchema) -> Result<(), EvolutionError> {
         if self.primary_key != next.primary_key {
             return Err(EvolutionError::PrimaryKeyChanged {
                 from: self.primary_key.clone(),
                 to: next.primary_key.clone(),
             });
-        }
-
-        for field in &self.fields {
-            let Some(replacement) = next.field(&field.name) else {
-                continue;
-            };
-            if replacement.field_type != field.field_type {
-                return Err(EvolutionError::TypeChanged {
-                    name: field.name.clone(),
-                    from: field.field_type.as_str(),
-                    to: replacement.field_type.as_str(),
-                });
-            }
         }
 
         for field in &next.fields {
@@ -442,6 +458,71 @@ pub fn typed_value<'a>(field: &FieldDef, value: &'a Value) -> Result<FieldValue<
             .as_i64()
             .map(FieldValue::Timestamp)
             .ok_or_else(mismatch),
+    }
+}
+
+/// Converts one JSON value to a declared type. Numbers, booleans, and strings
+/// convert when the value is unambiguous. `json` accepts any value and any
+/// value converts to `json`. Returns `None` when the value cannot be converted
+/// without guessing.
+pub fn coerce_value(value: &Value, target: FieldType) -> Option<Value> {
+    let field = FieldDef {
+        name: String::new(),
+        field_type: target,
+        required: false,
+        default: None,
+    };
+    if typed_value(&field, value).is_ok() {
+        return Some(value.clone());
+    }
+
+    match target {
+        FieldType::String => match value {
+            Value::Number(number) => Some(Value::String(number.to_string())),
+            Value::Bool(flag) => Some(Value::String(flag.to_string())),
+            _ => None,
+        },
+        FieldType::I64 | FieldType::Timestamp => match value {
+            Value::String(text) => text.parse::<i64>().ok().map(Value::from),
+            Value::Number(number) => number
+                .as_i64()
+                .or_else(|| {
+                    number
+                        .as_f64()
+                        .filter(|value| value.is_finite() && value.fract() == 0.0)
+                        .and_then(|value| {
+                            (value >= i64::MIN as f64 && value <= i64::MAX as f64)
+                                .then_some(value as i64)
+                        })
+                })
+                .map(Value::from),
+            Value::Bool(flag) => Some(Value::from(i64::from(*flag))),
+            _ => None,
+        },
+        FieldType::F64 => match value {
+            Value::String(text) => text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(Value::from),
+            Value::Number(number) => number.as_f64().map(Value::from),
+            Value::Bool(flag) => Some(Value::from(if *flag { 1.0 } else { 0.0 })),
+            _ => None,
+        },
+        FieldType::Bool => match value {
+            Value::String(text) => match text.as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            Value::Number(number) => match number.as_i64() {
+                Some(1) => Some(Value::Bool(true)),
+                Some(0) => Some(Value::Bool(false)),
+                _ => None,
+            },
+            _ => None,
+        },
+        FieldType::Json => Some(value.clone()),
     }
 }
 
@@ -749,6 +830,65 @@ mod tests {
         let object = typed_value(&json_field, &first).unwrap();
         assert!(object.equals(&typed_value(&json_field, &second).unwrap()));
         assert_eq!(object.compare(&object), None);
+    }
+
+    #[test]
+    fn coercions_cover_the_supported_matrix() {
+        assert_eq!(
+            coerce_value(&json!("0.5"), FieldType::F64),
+            Some(json!(0.5))
+        );
+        assert_eq!(coerce_value(&json!("7"), FieldType::I64), Some(json!(7)));
+        assert_eq!(
+            coerce_value(&json!("true"), FieldType::Bool),
+            Some(json!(true))
+        );
+        assert_eq!(coerce_value(&json!(2.0), FieldType::I64), Some(json!(2)));
+        assert_eq!(coerce_value(&json!(2.5), FieldType::I64), None);
+        assert_eq!(coerce_value(&json!(1), FieldType::Bool), Some(json!(true)));
+        assert_eq!(coerce_value(&json!(0), FieldType::Bool), Some(json!(false)));
+        assert_eq!(coerce_value(&json!(3), FieldType::String), Some(json!("3")));
+        assert_eq!(
+            coerce_value(&json!(true), FieldType::String),
+            Some(json!("true"))
+        );
+        assert_eq!(coerce_value(&json!("nope"), FieldType::I64), None);
+        assert_eq!(coerce_value(&json!({"a": 1}), FieldType::String), None);
+        assert_eq!(
+            coerce_value(&json!({"a": 1}), FieldType::Json),
+            Some(json!({"a": 1}))
+        );
+    }
+
+    #[test]
+    fn normalize_converts_values_written_under_the_old_schema() {
+        let schema = TableSchema::builder("t")
+            .field("id", FieldType::String)
+            .field("score", FieldType::F64)
+            .field("count", FieldType::I64)
+            .primary_key("id")
+            .build()
+            .unwrap();
+
+        let mut record = Record::new()
+            .set("id", json!("r"))
+            .set("score", json!("0.75"))
+            .set("count", json!("3"));
+        schema.normalize(&mut record).expect("values convert");
+
+        assert_eq!(record.get("score"), Some(&json!(0.75)));
+        assert_eq!(record.get("count"), Some(&json!(3)));
+        schema
+            .validate(&record)
+            .expect("normalized record validates");
+
+        let mut broken = Record::new()
+            .set("id", json!("r"))
+            .set("score", json!("high"));
+        assert!(matches!(
+            schema.normalize(&mut broken),
+            Err(RecordError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub use key::{
 
 pub use schema::{
     EvolutionError, FieldDef, FieldType, FieldValue, MAX_FIELD_NAME_BYTES, Record, RecordError,
-    SCHEMA_VERSION, SchemaBuilder, SchemaError, TableSchema, typed_value,
+    SCHEMA_VERSION, SchemaBuilder, SchemaError, TableSchema, coerce_value, typed_value,
 };
 
 pub use segment::{

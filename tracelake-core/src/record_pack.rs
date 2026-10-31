@@ -1,5 +1,5 @@
 use crate::crc::checksum;
-use crate::schema::{FieldType, FieldValue, Record, TableSchema, typed_value};
+use crate::schema::{FieldType, FieldValue, Record, TableSchema, coerce_value, typed_value};
 use serde_json::Value;
 use std::cmp::Ordering;
 use thiserror::Error;
@@ -78,18 +78,17 @@ pub fn encode_record_pack(
     schema: &TableSchema,
     records: &[Record],
 ) -> Result<Vec<u8>, RecordPackError> {
-    let declared: Vec<Record> = records
-        .iter()
-        .map(|record| {
-            let mut kept = Record::new();
-            for (name, value) in &record.fields {
-                if schema.field(name).is_some() {
-                    kept.fields.insert(name.clone(), value.clone());
-                }
+    let mut declared: Vec<Record> = Vec::with_capacity(records.len());
+    for record in records {
+        let mut kept = Record::new();
+        for (name, value) in &record.fields {
+            if schema.field(name).is_some() {
+                kept.fields.insert(name.clone(), value.clone());
             }
-            kept
-        })
-        .collect();
+        }
+        schema.normalize(&mut kept)?;
+        declared.push(kept);
+    }
     schema.validate_all(&declared)?;
 
     let mut sorted: Vec<(String, &Record)> = declared
@@ -371,18 +370,22 @@ fn decode_record_block(
 
         if let Some(declared) = declared
             && declared.field_type != pack_field.field_type
-            && wanted
         {
-            return Err(RecordPackError::FieldTypeMismatch {
-                field: pack_field.name.clone(),
-                pack: pack_field.field_type.as_str(),
-                requested: declared.field_type.as_str(),
-            });
+            let value = decode_value(block, &mut pos, pack_field.field_type, wanted)?;
+            if wanted {
+                let mismatch = || RecordPackError::FieldTypeMismatch {
+                    field: pack_field.name.clone(),
+                    pack: pack_field.field_type.as_str(),
+                    requested: declared.field_type.as_str(),
+                };
+                let value = value.ok_or_else(mismatch)?;
+                let converted = coerce_value(&value, declared.field_type).ok_or_else(mismatch)?;
+                record.fields.insert(pack_field.name.clone(), converted);
+            }
+            continue;
         }
 
-        let materialize =
-            wanted && declared.is_some_and(|def| def.field_type == pack_field.field_type);
-        let value = decode_value(block, &mut pos, pack_field.field_type, materialize)?;
+        let value = decode_value(block, &mut pos, pack_field.field_type, wanted)?;
         if let Some(value) = value {
             record.fields.insert(pack_field.name.clone(), value);
         }

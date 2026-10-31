@@ -150,7 +150,8 @@ let result = reader
 
 Schemas evolve. Adding an optional field, adding a required field with a default, and
 dropping a field are allowed; older segments keep their meaning because each pack records
-its own field list. Changing a field's type needs a new table.
+its own field list. Changing a field's type migrates stored packs and columns to
+the new type when every value converts.
 
 Aggregation runs over the Parquet column files that compaction writes:
 

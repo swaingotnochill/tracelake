@@ -267,6 +267,65 @@ impl RecordCompactor {
         Ok(entry)
     }
 
+    /// Rewrites every segment of one table under a new schema. Values are
+    /// converted through the pack decoder; a value that cannot convert stops
+    /// the migration before anything is written.
+    pub async fn migrate(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        table: &str,
+        new_schema: &TableSchema,
+    ) -> Result<Vec<SegmentEntry>, CompactError> {
+        let Some(mut manifest) =
+            read_record_manifest(&self.store, &self.base_path, tenant_id, namespace, table).await?
+        else {
+            return Ok(Vec::new());
+        };
+        if manifest.segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Dry run: every segment is read and converted before any write, so a
+        // failed conversion leaves the stored table untouched.
+        let mut staged = Vec::with_capacity(manifest.segments.len());
+        for entry in &manifest.segments {
+            let records = self.read_pack_records(entry, new_schema).await?;
+            staged.push((entry.clone(), records));
+        }
+
+        let mut next_segment = manifest.next_segment_number();
+        let mut removed_files = Vec::new();
+        let mut segments = Vec::with_capacity(staged.len());
+
+        for (entry, records) in staged {
+            removed_files.extend(entry.files.iter().map(|file| file.path.clone()));
+            if records.is_empty() {
+                continue;
+            }
+
+            let segment_id = tracelake_core::segment_id(next_segment);
+            next_segment += 1;
+            let group = RecordGroup {
+                tenant_id: tenant_id.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                schema: new_schema.clone(),
+                records,
+            };
+            segments.push(
+                self.write_segment_files(&group, new_schema, &segment_id)
+                    .await?,
+            );
+        }
+
+        manifest.segments = segments;
+        publish_manifest(&self.store, &self.base_path, &manifest).await?;
+        self.delete_files(&removed_files).await?;
+
+        Ok(manifest.segments)
+    }
+
     /// Writes every file of one record segment and returns its manifest entry.
     async fn write_segment_files(
         &self,

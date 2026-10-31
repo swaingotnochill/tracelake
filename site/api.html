@@ -144,7 +144,9 @@
 }</code></pre>
 <p><code>field_type</code> is <code>string</code>, <code>i64</code>, <code>f64</code>, <code>bool</code>, <code>json</code>, or <code>timestamp</code>. <code>timestamp</code> is an integer count of nanoseconds since the Unix epoch. The version in the body is ignored; the registry assigns it.</p>
 <p>Response: <code>{"table": "findings", "version": 2}</code>.</p>
-<p>Compatible changes are: add an optional field, add a required field with a default, and drop a field. A type change or a primary key change returns 409. An added required field without a default returns 400.</p>
+<p>Compatible changes are: add an optional field, add a required field with a default, drop a field, and change a field's type. A primary key change returns</p>
+<ol><li>An added required field without a default returns 400.</li></ol>
+<p>A type change rewrites every stored segment of the table under the new type and converts the values. Text converts to numbers when it parses, numbers convert to text, booleans convert to 0 and 1, and integral floats convert to integers. A value that cannot convert stops the migration before anything is written and returns 400; the schema and data stay unchanged. A field that changes to or from <code>json</code> accepts any value converted to <code>json</code>, and cannot convert from an object or array to a scalar.</p>
 <h3 id="read-a-schema">Read a schema</h3>
 <pre><code>GET /v1/tables/{tenant_id}/{namespace}/{table}/schema</code></pre>
 <p>Response: the registered schema, or 404.</p>

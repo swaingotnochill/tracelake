@@ -65,6 +65,16 @@ pub async fn put_schema(
             existing.evolve(schema)?;
             let mut next = schema.clone();
             next.version = existing.version + 1;
+
+            if !existing.type_changes(schema).is_empty() {
+                crate::record_compactor::RecordCompactor::new(
+                    Arc::clone(store),
+                    base_path.to_string(),
+                )
+                .migrate(tenant_id, namespace, &next.table, &next)
+                .await?;
+            }
+
             next
         }
     };
@@ -184,7 +194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_type_change_and_a_bare_required_field_are_refused() {
+    async fn a_type_change_is_accepted_and_a_bare_required_field_is_refused() {
         let store = store();
         put_schema(&store, "base", "tenant-1", "default", &notes_schema())
             .await
@@ -196,13 +206,14 @@ mod tests {
             .primary_key("id")
             .build()
             .unwrap();
-        let error = put_schema(&store, "base", "tenant-1", "default", &retyped)
+        let registered = put_schema(&store, "base", "tenant-1", "default", &retyped)
             .await
-            .expect_err("a type change must be refused");
-        assert!(matches!(
-            error,
-            CompactError::Evolution(EvolutionError::TypeChanged { .. })
-        ));
+            .expect("a type change is accepted and migrated");
+        assert_eq!(registered.version, 2);
+        assert_eq!(
+            registered.field("body").map(|field| field.field_type),
+            Some(FieldType::I64)
+        );
 
         let added_required = TableSchema::builder("notes")
             .field("id", FieldType::String)

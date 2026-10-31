@@ -51,6 +51,30 @@ pub async fn put_table_schema(
         )));
     }
 
+    if let Some(existing) = read_schema(
+        &state.store,
+        &state.base_path,
+        &tenant_id,
+        &namespace,
+        &table,
+    )
+    .await
+    .map_err(|error| server_error(error.to_string()))?
+        && !existing.type_changes(&schema).is_empty()
+    {
+        for mut record in state
+            .db
+            .get_table_records(&tenant_id, &namespace, &table)
+            .await
+            .map_err(ingest_error)?
+        {
+            schema
+                .normalize(&mut record)
+                .and_then(|_| schema.validate(&record))
+                .map_err(|error| bad_request(error.to_string()))?;
+        }
+    }
+
     let registered = put_schema(
         &state.store,
         &state.base_path,
@@ -61,7 +85,9 @@ pub async fn put_table_schema(
     .await
     .map_err(|error| match error {
         CompactError::Evolution(ref evolution) => evolution_error(evolution),
-        CompactError::Schema(_) => bad_request(error.to_string()),
+        CompactError::Schema(_) | CompactError::Record(_) | CompactError::RecordPack(_) => {
+            bad_request(error.to_string())
+        }
         other => server_error(other.to_string()),
     })?;
 

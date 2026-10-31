@@ -58,14 +58,15 @@ let schema = TableSchema::builder("inspect_ai_samples")
 <h2 id="register-and-evolve-the-schema">Register and evolve the schema</h2>
 <pre><code class="language-rust">let registered = put_schema(&amp;store, base_path, tenant_id, namespace, &amp;schema).await?;</code></pre>
 <p>The registry owns the version. The first registration writes version 1, an identical shape is a no-op, and a compatible change writes the next version. Segments record their own field list, so older data keeps its meaning after the schema moves on.</p>
-<table><thead><tr><th>Change</th><th>Allowed</th><th>How old records read</th></tr></thead><tbody><tr><td>Add an optional field</td><td>yes</td><td>field absent</td></tr><tr><td>Add a required field with a default</td><td>yes</td><td>the default</td></tr><tr><td>Add a required field without a default</td><td>no</td><td>earlier records cannot satisfy it</td></tr><tr><td>Drop a field</td><td>yes</td><td>field absent from the current schema</td></tr><tr><td>Change a field's type</td><td>no</td><td>the pack would decode as the wrong type</td></tr><tr><td>Change the primary key</td><td>no</td><td>record identity would change</td></tr></tbody></table>
+<table><thead><tr><th>Change</th><th>Allowed</th><th>How old records read</th></tr></thead><tbody><tr><td>Add an optional field</td><td>yes</td><td>field absent</td></tr><tr><td>Add a required field with a default</td><td>yes</td><td>the default</td></tr><tr><td>Add a required field without a default</td><td>no</td><td>earlier records cannot satisfy it</td></tr><tr><td>Drop a field</td><td>yes</td><td>field absent from the current schema</td></tr><tr><td>Change a field's type</td><td>yes</td><td>rewritten segments convert old values to the new type</td></tr><tr><td>Change the primary key</td><td>no</td><td>record identity would change</td></tr></tbody></table>
 <p>Adding a required field needs <code>required_field_with_default</code>:</p>
 <pre><code class="language-rust">let schema = TableSchema::builder("inspect_ai_samples")
     .field("sample_id", FieldType::String)
     .required_field_with_default("grader", FieldType::String, json!("exact_match"))
     .primary_key("sample_id")
     .build()?;</code></pre>
-<p>A type change needs a new table name and a rewrite of the records. Type changes are refused because a pack written as <code>string</code> cannot be read as <code>i64</code> without guessing.</p>
+<p>A type change is a migration, not a metadata edit. The registry rewrites every segment of the table under the new schema, converts each value, and replaces the manifest. Values convert when the change is unambiguous: text that parses as a number, numbers to text, booleans to 0 and 1, integral floats to integers, and anything to <code>json</code>. A value that cannot convert stops the migration before any write, so a failed change leaves the table and schema untouched.</p>
+<p>Until the next compaction, hot rows written under the old type are converted on read and again when a pack is written. Packs written before the change are converted on read by the same rules, so a reader is never served a value of the wrong type.</p>
 <h2 id="write-records">Write records</h2>
 <pre><code class="language-rust">let record = Record::new()
     .set("sample_id", json!("17@1"))

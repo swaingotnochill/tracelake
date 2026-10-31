@@ -294,6 +294,9 @@ mod tests {
 
     #[test]
     fn spans_round_trip_with_latency_and_tokens() {
+        let start = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 10, 1, 12, 0, 0)
+            .single()
+            .expect("start is valid");
         let spans = vec![Span {
             tenant_id: "tenant-1".to_string(),
             namespace: "default".to_string(),
@@ -302,8 +305,8 @@ mod tests {
             parent_span_id: None,
             span_type: SpanType::Llm,
             name: "completion".to_string(),
-            start_time: chrono::Utc::now(),
-            end_time: Some(chrono::Utc::now() + chrono::Duration::milliseconds(250)),
+            start_time: start,
+            end_time: Some(start + chrono::Duration::milliseconds(250)),
             status: SpanStatus::Ok,
             attributes: Value::Null,
             input: None,

@@ -150,7 +150,7 @@ let result = reader
         ..RecordQuery::default()
     })
     .await?;</code></pre>
-<p>Schemas evolve. Adding an optional field, adding a required field with a default, and dropping a field are allowed; older segments keep their meaning because each pack records its own field list. Changing a field's type needs a new table.</p>
+<p>Schemas evolve. Adding an optional field, adding a required field with a default, and dropping a field are allowed; older segments keep their meaning because each pack records its own field list. Changing a field's type migrates stored packs and columns to the new type when every value converts.</p>
 <p>Aggregation runs over the Parquet column files that compaction writes:</p>
 <pre><code class="language-rust">let result = reader
     .aggregate_records(tenant_id, namespace, "inspect_ai_samples", &amp;AggregateRequest {

@@ -50,7 +50,7 @@ own field list, so older data keeps its meaning after the schema moves on.
 | Add a required field with a default | yes | the default |
 | Add a required field without a default | no | earlier records cannot satisfy it |
 | Drop a field | yes | field absent from the current schema |
-| Change a field's type | no | the pack would decode as the wrong type |
+| Change a field's type | yes | rewritten segments convert old values to the new type |
 | Change the primary key | no | record identity would change |
 
 Adding a required field needs `required_field_with_default`:
@@ -63,8 +63,17 @@ let schema = TableSchema::builder("inspect_ai_samples")
     .build()?;
 ```
 
-A type change needs a new table name and a rewrite of the records. Type changes are
-refused because a pack written as `string` cannot be read as `i64` without guessing.
+A type change is a migration, not a metadata edit. The registry rewrites every
+segment of the table under the new schema, converts each value, and replaces the
+manifest. Values convert when the change is unambiguous: text that parses as a
+number, numbers to text, booleans to 0 and 1, integral floats to integers, and
+anything to `json`. A value that cannot convert stops the migration before any
+write, so a failed change leaves the table and schema untouched.
+
+Until the next compaction, hot rows written under the old type are converted on
+read and again when a pack is written. Packs written before the change are
+converted on read by the same rules, so a reader is never served a value of the
+wrong type.
 
 ## Write records
 

@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 use tracelake_core::{
-    FieldDef, FieldType, Record, RecordPackError, TableSchema, decode_record_pack,
+    FieldDef, FieldType, Record, RecordPackError, TableSchema, coerce_value, decode_record_pack,
     encode_record_pack,
 };
 
@@ -235,7 +235,7 @@ proptest! {
     }
 
     #[test]
-    fn a_type_change_errors_only_when_the_changed_field_is_requested(
+    fn a_type_change_converts_when_possible_and_errors_otherwise(
         (table, records) in schema_and_records()
     ) {
         let Some(target) = table
@@ -250,25 +250,41 @@ proptest! {
         let bytes = encode_record_pack(&table, &records).expect("valid records encode");
         let pack = decode_record_pack(&bytes).expect("encoded packs decode");
 
+        let new_type = if target.field_type == FieldType::I64 {
+            FieldType::String
+        } else {
+            FieldType::I64
+        };
         let mut retyped = table.clone();
         for field in &mut retyped.fields {
             if field.name == target.name {
-                field.field_type = if target.field_type == FieldType::I64 {
-                    FieldType::String
-                } else {
-                    FieldType::I64
-                };
+                field.field_type = new_type;
             }
         }
 
         for record in &records {
-            if record.get(&target.name).is_none() {
+            let Some(value) = record.get(&target.name) else {
                 continue;
-            }
+            };
             let record_id = table.record_id(record).expect("id derives");
-            let mismatch = pack.read_record_with(&retyped, &record_id, &[&target.name]);
-            let is_mismatch = matches!(mismatch, Err(RecordPackError::FieldTypeMismatch { .. }));
-            prop_assert!(is_mismatch);
+            let result = pack.read_record_with(&retyped, &record_id, &[&target.name]);
+
+            match coerce_value(value, new_type) {
+                Some(converted) => {
+                    let decoded = result
+                        .expect("lookup succeeds")
+                        .expect("record is present");
+                    prop_assert_eq!(decoded.get(&target.name), Some(&converted));
+                }
+                None => {
+                    let mismatch = matches!(
+                        result,
+                        Err(RecordPackError::FieldTypeMismatch { .. })
+                    );
+                    prop_assert!(mismatch);
+                }
+            }
         }
     }
+
 }

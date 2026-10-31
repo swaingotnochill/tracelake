@@ -183,8 +183,16 @@ in the body is ignored; the registry assigns it.
 Response: `{"table": "findings", "version": 2}`.
 
 Compatible changes are: add an optional field, add a required field with a
-default, and drop a field. A type change or a primary key change returns 409.
-An added required field without a default returns 400.
+default, drop a field, and change a field's type. A primary key change returns
+409. An added required field without a default returns 400.
+
+A type change rewrites every stored segment of the table under the new type and
+converts the values. Text converts to numbers when it parses, numbers convert to
+text, booleans convert to 0 and 1, and integral floats convert to integers. A
+value that cannot convert stops the migration before anything is written and
+returns 400; the schema and data stay unchanged. A field that changes to or from
+`json` accepts any value converted to `json`, and cannot convert from an object
+or array to a scalar.
 
 ### Read a schema
 

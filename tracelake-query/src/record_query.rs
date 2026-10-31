@@ -189,6 +189,7 @@ impl TraceLakeReader {
             .await?
         {
             schema.fill_defaults(&mut hot);
+            schema.normalize(&mut hot)?;
             found = Some(hot);
         }
 
@@ -257,6 +258,7 @@ impl TraceLakeReader {
             .await?
         {
             schema.fill_defaults(&mut record);
+            schema.normalize(&mut record)?;
             let record_id = schema.record_id(&record)?;
             if deleted.contains(&record_id) {
                 continue;
