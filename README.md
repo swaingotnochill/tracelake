@@ -5,7 +5,7 @@ uses NVMe/memory as hot cache, and beats generic databases on trace-native workl
 
 ## What It Does
 
-- **Ingest** spans from any LLM app (OTLP, HTTP, gRPC).
+- **Ingest** spans from any LLM app over HTTP.
 - **Fetch** a full trace tree in a single read — not a distributed row reconstruction.
 - **Search** prompts, outputs, tool errors with a Tantivy full-text index.
 - **Aggregate** latency, cost, tokens, scores with columnar analytics.
@@ -208,21 +208,122 @@ See [AGENTS.md](AGENTS.md).
 
 ## Quick Start
 
+The runnable application is the `tracelake-server` package. Its binary is also named `tracelake-server`. The root `tracelake` package is a workspace placeholder, so name the server package explicitly.
+
+### Run the server
+
 ```bash
-# Build
-cargo build
+cargo run -p tracelake-server
+```
 
-# Test
-cargo nextest run
+The server listens on `http://127.0.0.1:8080`. It creates `./tracelake-data` and keeps the SlateDB hot store under `hot/` and compacted segments under `segments/`. On startup it prints the address, the selected store, the read limits, and the main endpoints.
 
-# Lint
+To change the address or data directory:
+
+```bash
+TRACELAKE_ADDR=0.0.0.0:8080 \
+TRACELAKE_DATA_DIR=/var/lib/tracelake \
+cargo run -p tracelake-server
+```
+
+The default bind address is loopback because the alpha has no authentication. Keep it on loopback or a private network, or put an authenticating proxy in front of it.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TRACELAKE_ADDR` | `127.0.0.1:8080` | Bind address |
+| `TRACELAKE_STORE` | `local` | `local`, `s3`, or `gcs` |
+| `TRACELAKE_DATA_DIR` | `./tracelake-data` | Local store root |
+| `TRACELAKE_BUCKET` | unset | Bucket for S3 or GCS |
+| `TRACELAKE_REGION` | provider default | S3 region |
+| `TRACELAKE_ENDPOINT` | unset | S3-compatible endpoint such as MinIO |
+| `TRACELAKE_PREFIX` | `tracelake` | Prefix for remote hot and segment paths |
+| `TRACELAKE_QUERY_TIMEOUT_MS` | `30000` | Read timeout |
+| `TRACELAKE_TENANT_CONCURRENCY` | `16` | Concurrent reads per tenant |
+
+S3 and GCS use the provider credential chain (`AWS_*` or `GOOGLE_*`). The server does not read access keys from its own settings. For S3-compatible storage:
+
+```bash
+TRACELAKE_STORE=s3 \
+TRACELAKE_BUCKET=tracelake \
+TRACELAKE_REGION=us-east-1 \
+TRACELAKE_ENDPOINT=http://127.0.0.1:9000 \
+cargo run -p tracelake-server
+```
+
+For MinIO, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment. Run one server process per local data directory. Two processes against one local directory are untested.
+
+### Send a trace
+
+With the server running, ingest one span:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/spans \
+  -H 'content-type: application/json' \
+  -d '{
+    "spans": [{
+      "tenant_id": "acme",
+      "namespace": "prod",
+      "trace_id": "trace-1",
+      "span_id": "span-a",
+      "parent_span_id": null,
+      "span_type": "llm",
+      "name": "completion",
+      "start_time": "2026-11-01T12:00:00Z",
+      "end_time": "2026-11-01T12:00:01Z",
+      "status": "ok",
+      "attributes": {"env": "local"},
+      "input": {"prompt": "hello"},
+      "output": {"text": "world"},
+      "tokens": {"prompt": 10, "completion": 20, "total": 30},
+      "cost_usd": 0.001,
+      "model": "gpt-4o",
+      "provider": "openai",
+      "error": null,
+      "tags": ["smoke"],
+      "scores": [{"name": "quality", "value": 0.9}]
+    }]
+  }'
+```
+
+The response is `{"written":1}`.
+
+Fetch the trace:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/traces/acme/prod/trace-1
+```
+
+New spans are served from the hot store. To publish segments, compact the hot store:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/compact
+```
+
+Search the trace:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/traces/search \
+  -H 'content-type: application/json' \
+  -d '{"tenant_id":"acme","namespace":"prod","model":"gpt-4o","limit":10}'
+```
+
+The full HTTP API, including tables, eval ingestion, retention, and aggregation, is in [docs/api.md](docs/api.md).
+
+### Build and test
+
+```bash
+cargo build --workspace
+cargo nextest run --workspace
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-# Benchmark (once tracelake-bench exists)
-cargo bench -p tracelake-bench
+### Benchmark and profile
 
-# Profile (builds with debug info, links against mimalloc)
+```bash
+cargo run --release -p tracelake-bench
 cargo build --profile profiling --bin tracelake-server
 cargo flamegraph --profile profiling --bin tracelake-server
 ```
@@ -241,7 +342,7 @@ tracelake/
   tracelake-ingest/         # SlateDB integration, ingest endpoint
   tracelake-compact/        # compaction pipeline (trace packs, columns, text index)
   tracelake-query/          # query engine (fetch, search, aggregate)
-  tracelake-server/         # HTTP/gRPC server
+  tracelake-server/         # HTTP server
   tracelake-bench/          # benchmark suite
 ```
 
