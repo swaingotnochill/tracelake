@@ -258,4 +258,4 @@ latency and the range-read fix are in [docs/performance.md](docs/performance.md)
 
 ## License
 
-TBD
+TraceLake is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
